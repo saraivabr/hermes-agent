@@ -1934,30 +1934,32 @@ class GatewayRunner:
                 if start_ts:
                     elapsed_min = int((now - start_ts) / 60)
                     if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
+                        status_parts.append(f"{elapsed_min} min")
+                # Simplificado: não expor iteration ao usuário final
+                # if max_iter:
+                #     status_parts.append(f"iteration {iteration}/{max_iter}")
                 if current_tool:
-                    status_parts.append(f"running: {current_tool}")
+                    # Humanizar nome da tool
+                    tool_display = current_tool
+                    if current_tool == "terminal":
+                        tool_display = "⌨️ no terminal"
+                    elif current_tool in ("web_search", "browser_navigate", "browser_snapshot"):
+                        tool_display = "🌐 na web"
+                    elif "file" in current_tool or "edit" in current_tool or "write" in current_tool:
+                        tool_display = "📝 editando"
+                    else:
+                        tool_display = f"🛠️ {current_tool}"
+                    status_parts.append(tool_display)
             except Exception:
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
         if is_steer_mode:
-            message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
-            )
+            message = f"↪️ Já vou nisso{status_detail}."
         elif is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
-            )
+            message = f"🕓 Na fila{status_detail}."
         else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
-            )
+            message = f"⚡ Cortando aqui{status_detail}."
 
         # First-touch onboarding: the very first time a user sends a message
         # while the agent is busy, append a one-time hint explaining the
@@ -2050,14 +2052,14 @@ class GatewayRunner:
         if not active:
             return
 
-        action = "restarting" if self._restart_requested else "shutting down"
+        action = "reiniciando" if self._restart_requested else "desligando"
         hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+            "Vai cortar aqui. "
+            "Manda qualquer msg depois que eu tento continuar de onde parei."
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else "Vai cortar aqui."
         )
-        msg = f"⚠️ Gateway {action} — {hint}"
+        msg = f"↻ {action.capitalize()} — {hint}"
 
         notified: set = set()
         for session_key in active:
@@ -3878,8 +3880,8 @@ class GatewayRunner:
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
-                    return "Queued for the next turn."
-                return f"Queued for the next turn. ({depth} queued)"
+                    return "🕓 Na fila."
+                return f"🕓 Na fila. ({depth} msgs)"
 
             # /steer <prompt> — inject mid-run after the next tool call.
             # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
@@ -4695,10 +4697,10 @@ class GatewayRunner:
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
                             reason_text = f"inactive for {duration}"
                         notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
+                            f"🧼 Sessão limpa ({reason_text}). "
+                            f"Histórico zerado.\n"
+                            f"/resume pra ver sessões antigas.\n"
+                            f"Config em session_reset no config.yaml."
                         )
                         try:
                             session_info = self._format_session_info()
@@ -11282,7 +11284,7 @@ class GatewayRunner:
                 try:
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        f"⚡ Tô nisso... ({_elapsed_mins} min{_status_detail})",
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:

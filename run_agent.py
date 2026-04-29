@@ -5702,7 +5702,7 @@ class AIAgent:
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
-                        self._touch_activity("receiving stream response")
+                        self._touch_activity("🧠 Cozinhando aqui")
                         if self._interrupt_requested:
                             break
                         event_type = getattr(event, "type", "")
@@ -5827,7 +5827,7 @@ class AIAgent:
         collected_text_deltas: list = []
         try:
             for event in stream_or_response:
-                self._touch_activity("receiving stream response")
+                self._touch_activity("🧠 Cozinhando aqui")
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
@@ -6278,7 +6278,7 @@ class AIAgent:
         )
 
         _call_start = time.time()
-        self._touch_activity("waiting for non-streaming API response")
+        self._touch_activity("🧠 IA pensando")
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
@@ -6292,7 +6292,7 @@ class AIAgent:
             if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
                 _elapsed = time.time() - _call_start
                 self._touch_activity(
-                    f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
+                    f"🧠 Pensando ({int(_elapsed)}s)"
                 )
 
             # Stale-call detector: kill the connection if no response
@@ -6643,7 +6643,7 @@ class AIAgent:
             # Reset stale-stream timer so the detector measures from this
             # attempt's start, not a previous attempt's last chunk.
             last_chunk_time["t"] = time.time()
-            self._touch_activity("waiting for provider response (streaming)")
+            self._touch_activity("🧠 Modelo rodando")
             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
             # Capture rate limit headers from the initial HTTP response.
@@ -6667,7 +6667,7 @@ class AIAgent:
             usage_obj = None
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
-                self._touch_activity("receiving stream response")
+                self._touch_activity("🧠 Cozinhando aqui")
 
                 if self._interrupt_requested:
                     break
@@ -6873,7 +6873,7 @@ class AIAgent:
                     # actively arriving (the chat_completions path
                     # already does this at the top of its chunk loop).
                     last_chunk_time["t"] = time.time()
-                    self._touch_activity("receiving stream response")
+                    self._touch_activity("🧠 Cozinhando aqui")
 
                     if self._interrupt_requested:
                         break
@@ -7206,7 +7206,7 @@ class AIAgent:
                 _last_heartbeat = _hb_now
                 _waiting_secs = int(_hb_now - last_chunk_time["t"])
                 self._touch_activity(
-                    f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
+                    f"🧠 Aguardando ({_waiting_secs}s)"
                 )
 
             # Detect stale streams: connections kept alive by SSE pings
