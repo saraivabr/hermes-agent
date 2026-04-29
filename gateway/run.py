@@ -1848,7 +1848,12 @@ class GatewayRunner:
                 return True
 
             thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-            if self._queue_during_drain_enabled():
+            from gateway.status_microcopy import is_whatsapp_platform, render_gateway_draining
+
+            is_whatsapp = is_whatsapp_platform(event.source.platform)
+            if is_whatsapp:
+                message = render_gateway_draining(self._restart_requested)
+            elif self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
@@ -4079,6 +4084,10 @@ class GatewayRunner:
                     )
                 return None
             if self._draining:
+                if source.platform.value == "whatsapp":
+                    from gateway.status_microcopy import render_gateway_draining
+
+                    return render_gateway_draining(self._restart_requested)
                 if self._queue_during_drain_enabled():
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
@@ -5224,6 +5233,11 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            _was_interrupted = bool(agent_result.get("interrupted")) or response.startswith("Operation interrupted:")
+            if source.platform.value == "whatsapp" and response.startswith("Operation interrupted:"):
+                from gateway.status_microcopy import render_operation_interrupted
+
+                response = render_operation_interrupted(response)
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -5250,19 +5264,21 @@ class GatewayRunner:
             # This ensures the counter only accumulates across CONSECUTIVE
             # restarts where the session was active (never completed).
             #
-            # Also clear the resume_pending flag (set by drain-timeout
-            # shutdown) — the turn ran to completion, so recovery
-            # succeeded and subsequent messages should no longer receive
-            # the restart-interruption system note.
+            # Only clear resume_pending when the turn actually completed.
+            # If shutdown interruption yields an "Operation interrupted..."
+            # final response, preserving resume_pending is what lets the next
+            # user message continue the existing transcript instead of being
+            # auto-reset on startup.
             if session_key:
-                self._clear_restart_failure_count(session_key)
-                try:
-                    self.session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
-                    )
+                if not _was_interrupted:
+                    self._clear_restart_failure_count(session_key)
+                    try:
+                        self.session_store.clear_resume_pending(session_key)
+                    except Exception as _e:
+                        logger.debug(
+                            "clear_resume_pending failed for %s: %s",
+                            session_key, _e,
+                        )
 
             # Surface error details when the agent failed silently (final_response=None)
             if not response and agent_result.get("failed"):

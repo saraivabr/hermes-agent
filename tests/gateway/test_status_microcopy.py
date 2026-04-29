@@ -8,7 +8,9 @@ from gateway.status_microcopy import (
     compact_file_label,
     is_whatsapp_platform,
     render_busy_ack,
+    render_gateway_draining,
     render_long_running,
+    render_operation_interrupted,
     render_session_reset,
     render_shutdown,
     render_tool_progress,
@@ -51,6 +53,9 @@ def test_alert_and_reset_copy_is_ptbr():
     assert render_shutdown(restarting=True) == "↻ Reiniciando a ponte."
     assert render_shutdown(restarting=False) == "⚠️ Vai cortar aqui."
     assert render_session_reset("inactive for 24h") == "🧼 Sessão limpa."
+    assert render_gateway_draining(restarting=True) == "↻ Reiniciando. Já volto."
+    assert render_gateway_draining(restarting=False) == "⚠️ Fechando a ponte."
+    assert render_operation_interrupted("Operation interrupted: waiting") == "⚠️ Interrompido na resposta."
 
 
 def test_long_running_maps_model_wait_to_ptbr():

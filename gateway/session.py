@@ -1074,9 +1074,12 @@ class SessionStore:
 
         Entries flagged ``resume_pending=True`` are skipped — those were
         marked intentionally by the drain-timeout path as recoverable.
-        Terminal escalation for genuinely stuck ``resume_pending`` sessions
-        is handled by the existing ``.restart_failure_counts`` stuck-loop
-        counter, which runs after this method on startup.
+        WhatsApp sessions are also treated as recoverable on startup: mobile
+        chat users expect continuity after a gateway restart, and the gateway
+        can inject the resume note on the next turn.  Terminal escalation for
+        genuinely stuck ``resume_pending`` sessions is handled by the existing
+        ``.restart_failure_counts`` stuck-loop counter, which runs after this
+        method on startup.
         """
         from datetime import timedelta
 
@@ -1088,7 +1091,12 @@ class SessionStore:
                 if entry.resume_pending:
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
-                    entry.suspended = True
+                    if getattr(entry.platform, "value", entry.platform) == "whatsapp":
+                        entry.resume_pending = True
+                        entry.resume_reason = "shutdown_timeout"
+                        entry.last_resume_marked_at = _now()
+                    else:
+                        entry.suspended = True
                     count += 1
             if count:
                 self._save()

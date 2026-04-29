@@ -17,6 +17,9 @@ RESTART = "↻ Reiniciando a ponte."
 SESSION_RESET = "🧼 Sessão limpa."
 UPDATE = "↻ Atualizando Hermes."
 GENERIC_TOOL = "⚙️ Rodando."
+RESTARTING_BUSY = "↻ Reiniciando. Já volto."
+SHUTTING_DOWN_BUSY = "⚠️ Fechando a ponte."
+INTERRUPTED_MODEL = "⚠️ Interrompido na resposta."
 _MAX_STATUS_LEN = 45
 
 _MODEL_ACTIVITY_HINTS = (
@@ -237,3 +240,13 @@ def render_shutdown(restarting: bool) -> str:
 def render_session_reset(reason: str | None = None) -> str:
     """Render session reset copy."""
     return SESSION_RESET
+
+
+def render_gateway_draining(restarting: bool) -> str:
+    """Render a short gateway-draining notice."""
+    return RESTARTING_BUSY if restarting else SHUTTING_DOWN_BUSY
+
+
+def render_operation_interrupted(text: str | None = None) -> str:
+    """Render a user-facing interruption notice."""
+    return INTERRUPTED_MODEL

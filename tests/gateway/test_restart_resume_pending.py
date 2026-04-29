@@ -390,6 +390,23 @@ class TestSuspendRecentlyActiveSkipsResumePending:
         assert store._entries[entry_a.session_key].suspended is False
         assert store._entries[entry_b.session_key].suspended is True
 
+    def test_whatsapp_recent_sessions_become_resume_pending_not_suspended(self, tmp_path):
+        """WhatsApp restart recovery must preserve chat continuity."""
+        store = _make_store(tmp_path)
+        source = _make_source(platform=Platform.WHATSAPP, chat_id="5511999999999@lid")
+        entry = store.get_or_create_session(source)
+
+        count = store.suspend_recently_active()
+
+        assert count == 1
+        e = store._entries[entry.session_key]
+        assert e.suspended is False
+        assert e.resume_pending is True
+        assert e.resume_reason == "shutdown_timeout"
+        resumed = store.get_or_create_session(source)
+        assert resumed.session_id == entry.session_id
+        assert getattr(resumed, "was_auto_reset", False) is False
+
 
 # ---------------------------------------------------------------------------
 # Restart-resume system-note injection
