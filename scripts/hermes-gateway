@@ -46,7 +46,7 @@ if env_path.exists():
 # =============================================================================
 
 SERVICE_NAME = "hermes-gateway"
-SERVICE_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
+SERVICE_DESCRIPTION = "EMPRESA.IA Gateway - Messaging Platform Integration"
 
 def get_systemd_unit_path() -> Path:
     """Get the path for the systemd user service file."""
@@ -295,7 +295,7 @@ def is_windows() -> bool:
 def run_gateway():
     """Run the gateway in foreground."""
     from gateway.run import start_gateway
-    print("Starting Hermes Gateway...")
+    print("Starting EMPRESA.IA Gateway...")
     print("Press Ctrl+C to stop.")
     print()
     asyncio.run(start_gateway())
