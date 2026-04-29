@@ -157,6 +157,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
     - allow_from: List of sender IDs allowed in DMs (when dm_policy="allowlist")
     - group_policy: "open" | "allowlist" | "disabled" — which groups are processed (default: "open")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
+    - reaction_mode: "alerts" | "all" | "off" — automatic reactions (default: "alerts")
     """
     
     # WhatsApp message limits — practical UX limit, not protocol max.
@@ -189,7 +190,22 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
-        self._human_policy = WhatsAppHumanBehaviorPolicy()
+        reaction_mode = str(
+            config.extra.get("reaction_mode")
+            or config.extra.get("reactionMode")
+            or os.getenv("WHATSAPP_REACTION_MODE", "alerts")
+        ).strip().lower()
+        if reaction_mode not in {"alerts", "all", "off"}:
+            reaction_mode = "alerts"
+        reactions_raw = config.extra.get("reactions", os.getenv("WHATSAPP_REACTIONS", "true"))
+        if isinstance(reactions_raw, str):
+            reactions_enabled = reactions_raw.strip().lower() not in {"false", "0", "no", "off"}
+        else:
+            reactions_enabled = bool(reactions_raw)
+        self._human_policy = WhatsAppHumanBehaviorPolicy(
+            reactions=reactions_enabled,
+            reaction_mode=reaction_mode,
+        )
 
     def _whatsapp_require_mention(self) -> bool:
         configured = self.config.extra.get("require_mention")

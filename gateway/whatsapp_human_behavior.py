@@ -36,6 +36,7 @@ class WhatsAppHumanBehaviorPolicy:
 
     read_receipts: bool = True
     reactions: bool = True
+    reaction_mode: str = "alerts"
     quote_group_replies: bool = True
     group_ambient_context: bool = True
     max_context_messages_dm: int = 12
@@ -71,7 +72,7 @@ class WhatsAppHumanBehaviorPolicy:
         )
 
     def initial_reaction(self, *, chat_type: str | None = None, chat_id: str | None = None) -> str | None:
-        if not self.reactions:
+        if not self.reactions or self.reaction_mode != "all":
             return None
         if self.chat_kind(chat_type, chat_id) == WhatsAppChatKind.CHANNEL:
             return None
@@ -80,7 +81,11 @@ class WhatsAppHumanBehaviorPolicy:
     def completion_reaction(self, *, success: bool, cancelled: bool = False) -> str | None:
         if not self.reactions or cancelled:
             return None
-        return "✅" if success else "⚠️"
+        if self.reaction_mode == "off":
+            return None
+        if success:
+            return "✅" if self.reaction_mode == "all" else None
+        return "⚠️"
 
     def typing_sequence(self, *, voice: bool = False) -> tuple[WhatsAppPresence, ...]:
         if voice:

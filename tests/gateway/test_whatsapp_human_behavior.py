@@ -48,7 +48,7 @@ class _HookAdapter(WhatsAppAdapter):
         return {"success": True}
 
 
-def test_processing_hooks_use_reactions_and_read_receipts():
+def test_processing_hooks_default_to_read_receipts_without_success_reactions():
     adapter = _HookAdapter()
     source = SessionSource(platform=Platform.WHATSAPP, chat_id="120@g.us", chat_type="group", user_id="u")
     event = MessageEvent(
@@ -65,8 +65,49 @@ def test_processing_hooks_use_reactions_and_read_receipts():
 
     asyncio.run(_run())
 
-    assert ("POST", "/react", {"chatId": "120@g.us", "messageId": "MSG1", "emoji": "👀", "participant": "5511999999999@s.whatsapp.net"}) in adapter.calls
     assert ("POST", "/read", {"chatId": "120@g.us", "messageId": "MSG1", "participant": "5511999999999@s.whatsapp.net"}) in adapter.calls
+    assert not [call for call in adapter.calls if call[1] == "/react"]
+
+
+def test_processing_hooks_react_only_on_real_alert_by_default():
+    adapter = _HookAdapter()
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id="120@g.us", chat_type="group", user_id="u")
+    event = MessageEvent(
+        text="oi",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="MSG1",
+        raw_message={"senderId": "5511999999999@s.whatsapp.net"},
+    )
+
+    async def _run():
+        await adapter.on_processing_start(event)
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    asyncio.run(_run())
+
+    assert ("POST", "/react", {"chatId": "120@g.us", "messageId": "MSG1", "emoji": "⚠️", "participant": "5511999999999@s.whatsapp.net"}) in adapter.calls
+
+
+def test_reaction_mode_all_preserves_legacy_lifecycle_reactions():
+    adapter = _HookAdapter()
+    adapter._human_policy = WhatsAppHumanBehaviorPolicy(reaction_mode="all")
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id="120@g.us", chat_type="group", user_id="u")
+    event = MessageEvent(
+        text="oi",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="MSG1",
+        raw_message={"senderId": "5511999999999@s.whatsapp.net"},
+    )
+
+    async def _run():
+        await adapter.on_processing_start(event)
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    asyncio.run(_run())
+
+    assert ("POST", "/react", {"chatId": "120@g.us", "messageId": "MSG1", "emoji": "👀", "participant": "5511999999999@s.whatsapp.net"}) in adapter.calls
     assert ("POST", "/react", {"chatId": "120@g.us", "messageId": "MSG1", "emoji": "✅", "participant": "5511999999999@s.whatsapp.net"}) in adapter.calls
 
 
