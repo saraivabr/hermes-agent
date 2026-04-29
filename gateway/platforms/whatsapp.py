@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import subprocess
+from urllib.parse import quote
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -105,12 +106,14 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
     cache_audio_from_url,
     resolve_channel_prompt,
 )
+from gateway.whatsapp_human_behavior import WhatsAppHumanBehaviorPolicy
 
 
 def check_whatsapp_requirements() -> bool:
@@ -186,6 +189,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
+        self._human_policy = WhatsAppHumanBehaviorPolicy()
 
     def _whatsapp_require_mention(self) -> bool:
         configured = self.config.extra.get("require_mention")
@@ -707,6 +711,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 if reply_to and last_message_id is None:
                     # Only reply-to on the first chunk
                     payload["replyTo"] = reply_to
+                    if metadata and metadata.get("reply_to_participant"):
+                        payload["replyToParticipant"] = metadata.get("reply_to_participant")
 
                 async with self._http_session.post(
                     f"http://127.0.0.1:{self._bridge_port}/send",
@@ -793,6 +799,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 payload["caption"] = caption
             if file_name:
                 payload["fileName"] = file_name
+            if media_type == "audio":
+                payload["ptt"] = True
 
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/send-media",
@@ -877,21 +885,116 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        await self.send_presence(chat_id, "composing")
+
+    async def send_presence(self, chat_id: str, presence: str = "composing") -> None:
+        """Send an explicit WhatsApp presence state via bridge."""
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
             return
-        
+
         try:
             import aiohttp
 
             await self._http_session.post(
-                f"http://127.0.0.1:{self._bridge_port}/typing",
-                json={"chatId": chat_id},
+                f"http://127.0.0.1:{self._bridge_port}/presence",
+                json={"chatId": chat_id, "presence": presence},
                 timeout=aiohttp.ClientTimeout(total=5)
             )
         except Exception:
-            pass  # Ignore typing indicator failures
+            pass  # Ignore presence failures
+
+    async def _keep_typing(
+        self,
+        chat_id: str,
+        interval: float = 2.0,
+        metadata=None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """Finite WhatsApp presence sequence; never type forever."""
+        sequence = self._human_policy.typing_sequence(voice=bool(metadata and metadata.get("voice")))
+        delays = (0.0, 3.5, 8.0, 2.0, 0.0)
+        try:
+            for idx, presence in enumerate(sequence):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                await self.send_presence(chat_id, presence.value)
+                delay = delays[idx] if idx < len(delays) else interval
+                if delay <= 0:
+                    continue
+                if stop_event is None:
+                    await asyncio.sleep(delay)
+                    continue
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+            if stop_event is not None:
+                await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self.send_presence(chat_id, "unavailable")
+            self._typing_paused.discard(chat_id)
+
+    async def mark_read(self, chat_id: str, message_id: Optional[str] = None, participant: Optional[str] = None) -> Dict[str, Any]:
+        """Mark a WhatsApp chat/message as read."""
+        return await self._bridge_request(
+            "POST",
+            "/read",
+            json_payload={"chatId": chat_id, "messageId": message_id, "participant": participant},
+            timeout_seconds=10,
+        )
+
+    async def react_to_message(self, chat_id: str, message_id: str, emoji: str, participant: Optional[str] = None) -> Dict[str, Any]:
+        """React to a WhatsApp message."""
+        return await self._bridge_request(
+            "POST",
+            "/react",
+            json_payload={"chatId": chat_id, "messageId": message_id, "emoji": emoji, "participant": participant},
+            timeout_seconds=10,
+        )
+
+    async def modify_chat(self, chat_id: str, action: str, **kwargs) -> Dict[str, Any]:
+        """Run a safe chat-modify bridge action."""
+        payload = {"chatId": chat_id, "action": action}
+        payload.update(kwargs)
+        return await self._bridge_request("POST", "/chat/modify", json_payload=payload, timeout_seconds=15)
+
+    async def get_profile_info(self, jid: str) -> Dict[str, Any]:
+        """Fetch profile/status/business metadata through Baileys."""
+        return await self._bridge_request("GET", f"/profile/{jid}", timeout_seconds=15)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Use lightweight WhatsApp reaction/read receipts for processing start."""
+        if not event or not event.source or not event.message_id:
+            return
+        fields = {"chat_type": event.source.chat_type, "chat_id": event.source.chat_id}
+        emoji = self._human_policy.initial_reaction(**fields)
+        participant = None
+        if isinstance(event.raw_message, dict):
+            participant = event.raw_message.get("senderId")
+        if emoji:
+            await self.react_to_message(event.source.chat_id, event.message_id, emoji, participant=participant)
+        if self._human_policy.read_receipts:
+            await self.mark_read(event.source.chat_id, event.message_id, participant=participant)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Swap in a terminal reaction when WhatsApp processing completes."""
+        if not event or not event.source or not event.message_id:
+            return
+        emoji = self._human_policy.completion_reaction(
+            success=outcome == ProcessingOutcome.SUCCESS,
+            cancelled=outcome == ProcessingOutcome.CANCELLED,
+        )
+        if not emoji:
+            return
+        participant = None
+        if isinstance(event.raw_message, dict):
+            participant = event.raw_message.get("senderId")
+        await self.react_to_message(event.source.chat_id, event.message_id, emoji, participant=participant)
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a WhatsApp chat."""
@@ -963,6 +1066,28 @@ class WhatsAppAdapter(BasePlatformAdapter):
             "POST",
             "/groups/create",
             json_payload={"subject": subject, "participants": participants},
+            timeout_seconds=60,
+        )
+
+    async def get_group_metadata(self, chat_id: str) -> Dict[str, Any]:
+        """Fetch complete WhatsApp group metadata via the bridge."""
+        return await self._bridge_request(
+            "GET",
+            f"/groups/metadata/{chat_id}",
+            timeout_seconds=20,
+        )
+
+    async def update_group_join_approval(
+        self,
+        chat_id: str,
+        participants: list[str],
+        action: str = "approve",
+    ) -> Dict[str, Any]:
+        """Approve or reject pending WhatsApp group join requests."""
+        return await self._bridge_request(
+            "POST",
+            "/groups/join-approval",
+            json_payload={"chatId": chat_id, "participants": participants, "action": action},
             timeout_seconds=60,
         )
 
@@ -1054,6 +1179,39 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 await asyncio.sleep(5)
             
             await asyncio.sleep(1)  # Poll interval
+
+    async def _recent_chat_context_prompt(self, chat_id: str, limit: int) -> str:
+        """Return a compact same-chat history prompt for group context."""
+        if not chat_id:
+            return ""
+        try:
+            path = f"/history?chatId={quote(chat_id, safe='@._-')}&limit={int(limit)}"
+            data = await self._bridge_request("GET", path, timeout_seconds=10)
+            messages = data.get("messages") if isinstance(data, dict) else None
+            if not isinstance(messages, list):
+                return ""
+            lines = []
+            for item in reversed(messages[-limit:]):
+                if not isinstance(item, dict) or item.get("chatId") != chat_id:
+                    continue
+                body = " ".join(str(item.get("body") or "").split())
+                if not body:
+                    continue
+                sender = str(item.get("senderName") or item.get("senderId") or "alguem")
+                sender = re.sub(r"\d{8,}@[a-z.]+", "participante", sender, flags=re.I)
+                sender = sender[:40]
+                body = body[:240]
+                lines.append(f"- {sender}: {body}")
+            if not lines:
+                return ""
+            return (
+                "Recent same-group WhatsApp context only. "
+                "Do not infer or reveal anything from other chats:\n"
+                + "\n".join(lines[-limit:])
+            )
+        except Exception as exc:
+            logger.debug("Could not load WhatsApp recent context for %s: %s", chat_id, exc)
+            return ""
     
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
@@ -1173,16 +1331,27 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
             channel_prompt = None
             if is_group:
+                chat_id = str(data.get("chatId") or "")
                 configured_prompt = resolve_channel_prompt(
                     self.config.extra,
-                    str(data.get("chatId") or ""),
+                    chat_id,
                 )
                 group_guard = self._group_privacy_prompt(
-                    str(data.get("chatId") or ""),
+                    chat_id,
                     data.get("chatName"),
                 )
+                recent_context = ""
+                if self._human_policy.should_inject_context(
+                    chat_type=chat_type,
+                    chat_id=chat_id,
+                    triggered=True,
+                ):
+                    recent_context = await self._recent_chat_context_prompt(
+                        chat_id,
+                        self._human_policy.context_limit(chat_type=chat_type, chat_id=chat_id),
+                    )
                 channel_prompt = "\n\n".join(
-                    part for part in (configured_prompt, group_guard) if part
+                    part for part in (configured_prompt, group_guard, recent_context) if part
                 )
 
             return MessageEvent(

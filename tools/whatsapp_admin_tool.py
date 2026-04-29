@@ -85,6 +85,12 @@ def _normalize_participants(value: Any) -> list[str]:
     return []
 
 
+def _confirm_required(args: Dict[str, Any], action: str) -> str | None:
+    if bool(args.get("confirm")):
+        return None
+    return f"Action {action} mutates WhatsApp state and requires confirm=true"
+
+
 WHATSAPP_ADMIN_SCHEMA = {
     "name": "whatsapp_admin",
     "description": (
@@ -104,6 +110,13 @@ WHATSAPP_ADMIN_SCHEMA = {
                     "history_chats",
                     "search",
                     "history",
+                    "profile",
+                    "presence",
+                    "read",
+                    "react",
+                    "chat_modify",
+                    "group_metadata",
+                    "join_approval",
                     "create_group",
                     "set_subject",
                     "set_description",
@@ -115,6 +128,20 @@ WHATSAPP_ADMIN_SCHEMA = {
                 "description": "Operation to perform.",
             },
             "chatId": {"type": "string", "description": "WhatsApp chat/group JID, e.g. 120363...@g.us."},
+            "jid": {"type": "string", "description": "WhatsApp contact/group JID for profile lookup."},
+            "messageId": {"type": "string", "description": "WhatsApp message ID for read/react/chat_modify."},
+            "emoji": {"type": "string", "description": "Emoji reaction text."},
+            "presence": {
+                "type": "string",
+                "enum": ["available", "unavailable", "composing", "recording", "paused"],
+                "description": "Presence state for presence action.",
+            },
+            "chatModifyAction": {
+                "type": "string",
+                "enum": ["archive", "unarchive", "mute", "unmute", "mark_unread", "mark_read", "star", "unstar"],
+                "description": "Action for chat_modify.",
+            },
+            "durationSeconds": {"type": "integer", "description": "Duration for mute action."},
             "subject": {"type": "string", "description": "Group subject/name for create_group or set_subject."},
             "description": {"type": "string", "description": "Group description text for set_description."},
             "filePath": {"type": "string", "description": "Absolute local path to image for set_photo."},
@@ -126,7 +153,7 @@ WHATSAPP_ADMIN_SCHEMA = {
             "participant": {"type": "string", "description": "Single participant phone/JID; convenience alternative to participants[]."},
             "participantAction": {
                 "type": "string",
-                "enum": ["add", "remove", "promote", "demote"],
+                "enum": ["add", "remove", "promote", "demote", "approve", "reject"],
                 "description": "Action for participants operation.",
             },
             "setting": {
@@ -135,6 +162,7 @@ WHATSAPP_ADMIN_SCHEMA = {
                 "description": "Group setting for group_settings operation.",
             },
             "revoke": {"type": "boolean", "description": "For invite: revoke current invite and return a new one."},
+            "confirm": {"type": "boolean", "description": "Required for actions that mutate WhatsApp state."},
             "q": {"type": "string", "description": "Search query for local WhatsApp history."},
             "limit": {"type": "integer", "description": "History/search result limit."},
             "before": {"type": "integer", "description": "Only history before this Unix timestamp."},
@@ -158,6 +186,51 @@ def whatsapp_admin_tool(args, **kw):
             return tool_error("chatId is required for chat_info")
         return json.dumps(_http_json("GET", f"/chat/{parse.quote(str(chat_id), safe='@._-')}", timeout=10), ensure_ascii=False)
 
+    if action == "profile":
+        jid = args.get("jid") or args.get("chatId")
+        if not jid:
+            return tool_error("jid or chatId is required for profile")
+        return json.dumps(_http_json("GET", f"/profile/{parse.quote(str(jid), safe='@._-')}", timeout=15), ensure_ascii=False)
+
+    if action == "presence":
+        chat_id = args.get("chatId")
+        if not chat_id:
+            return tool_error("chatId is required for presence")
+        return json.dumps(_http_json("POST", "/presence", {"chatId": chat_id, "presence": args.get("presence") or "composing"}, timeout=10), ensure_ascii=False)
+
+    if action == "read":
+        chat_id = args.get("chatId")
+        if not chat_id:
+            return tool_error("chatId is required for read")
+        payload = {"chatId": chat_id, "messageId": args.get("messageId"), "participant": args.get("participant")}
+        return json.dumps(_http_json("POST", "/read", payload, timeout=10), ensure_ascii=False)
+
+    if action == "react":
+        chat_id = args.get("chatId")
+        message_id = args.get("messageId")
+        if not chat_id or not message_id:
+            return tool_error("chatId and messageId are required for react")
+        payload = {"chatId": chat_id, "messageId": message_id, "participant": args.get("participant"), "emoji": args.get("emoji") or ""}
+        return json.dumps(_http_json("POST", "/react", payload, timeout=10), ensure_ascii=False)
+
+    if action == "chat_modify":
+        chat_id = args.get("chatId")
+        chat_action = args.get("chatModifyAction")
+        if not chat_id or not chat_action:
+            return tool_error("chatId and chatModifyAction are required for chat_modify")
+        if chat_action in {"archive", "unarchive", "mute", "unmute", "mark_unread", "star", "unstar"}:
+            err = _confirm_required(args, "chat_modify")
+            if err:
+                return tool_error(err)
+        payload = {
+            "chatId": chat_id,
+            "action": chat_action,
+            "messageId": args.get("messageId"),
+            "participant": args.get("participant"),
+            "durationSeconds": args.get("durationSeconds"),
+        }
+        return json.dumps(_http_json("POST", "/chat/modify", payload, timeout=15), ensure_ascii=False)
+
     if action == "history_chats":
         return json.dumps(_http_json("GET", "/history/chats", timeout=10), ensure_ascii=False)
 
@@ -171,6 +244,26 @@ def whatsapp_admin_tool(args, **kw):
             path += "?" + parse.urlencode(query)
         return json.dumps(_http_json("GET", path, timeout=20), ensure_ascii=False)
 
+    if action == "group_metadata":
+        chat_id = args.get("chatId")
+        if not chat_id:
+            return tool_error("chatId is required for group_metadata")
+        return json.dumps(_http_json("GET", f"/groups/metadata/{parse.quote(str(chat_id), safe='@._-')}", timeout=20), ensure_ascii=False)
+
+    if action == "join_approval":
+        chat_id = args.get("chatId")
+        participant_action = str(args.get("participantAction") or "approve").lower()
+        participants = _normalize_participants(args.get("participants"))
+        if args.get("participant"):
+            participants.append(str(args["participant"]).strip())
+        if not chat_id or not participants:
+            return tool_error("chatId and participants[] are required for join_approval")
+        err = _confirm_required(args, "join_approval")
+        if err:
+            return tool_error(err)
+        payload = {"chatId": chat_id, "participants": participants, "action": participant_action}
+        return json.dumps(_http_json("POST", "/groups/join-approval", payload, timeout=60), ensure_ascii=False)
+
     if action == "create_group":
         subject = args.get("subject")
         participants = _normalize_participants(args.get("participants"))
@@ -178,6 +271,9 @@ def whatsapp_admin_tool(args, **kw):
             participants.append(str(args["participant"]).strip())
         if not subject or not participants:
             return tool_error("subject and participants[] are required for create_group")
+        err = _confirm_required(args, "create_group")
+        if err:
+            return tool_error(err)
         return json.dumps(_http_json("POST", "/groups/create", {"subject": subject, "participants": participants}, timeout=60), ensure_ascii=False)
 
     if action == "set_subject":
@@ -185,12 +281,18 @@ def whatsapp_admin_tool(args, **kw):
         subject = args.get("subject")
         if not chat_id or not subject:
             return tool_error("chatId and subject are required for set_subject")
+        err = _confirm_required(args, "set_subject")
+        if err:
+            return tool_error(err)
         return json.dumps(_http_json("POST", "/groups/subject", {"chatId": chat_id, "subject": subject}), ensure_ascii=False)
 
     if action == "set_description":
         chat_id = args.get("chatId")
         if not chat_id:
             return tool_error("chatId is required for set_description")
+        err = _confirm_required(args, "set_description")
+        if err:
+            return tool_error(err)
         return json.dumps(_http_json("POST", "/groups/description", {"chatId": chat_id, "description": args.get("description") or ""}), ensure_ascii=False)
 
     if action == "set_photo":
@@ -198,6 +300,9 @@ def whatsapp_admin_tool(args, **kw):
         file_path = args.get("filePath")
         if not chat_id or not file_path:
             return tool_error("chatId and filePath are required for set_photo")
+        err = _confirm_required(args, "set_photo")
+        if err:
+            return tool_error(err)
         return json.dumps(_http_json("POST", "/groups/photo", {"chatId": chat_id, "filePath": file_path}, timeout=60), ensure_ascii=False)
 
     if action == "participants":
@@ -208,6 +313,9 @@ def whatsapp_admin_tool(args, **kw):
             participants.append(str(args["participant"]).strip())
         if not chat_id or not participants:
             return tool_error("chatId and participants[] are required for participants")
+        err = _confirm_required(args, "participants")
+        if err:
+            return tool_error(err)
         payload = {"chatId": chat_id, "participants": participants, "action": participant_action}
         return json.dumps(_http_json("POST", "/groups/participants", payload, timeout=60), ensure_ascii=False)
 
@@ -216,12 +324,19 @@ def whatsapp_admin_tool(args, **kw):
         setting = args.get("setting")
         if not chat_id or not setting:
             return tool_error("chatId and setting are required for group_settings")
+        err = _confirm_required(args, "group_settings")
+        if err:
+            return tool_error(err)
         return json.dumps(_http_json("POST", "/groups/settings", {"chatId": chat_id, "setting": setting}), ensure_ascii=False)
 
     if action == "invite":
         chat_id = args.get("chatId")
         if not chat_id:
             return tool_error("chatId is required for invite")
+        if args.get("revoke"):
+            err = _confirm_required(args, "invite revoke")
+            if err:
+                return tool_error(err)
         return json.dumps(_http_json("POST", "/groups/invite", {"chatId": chat_id, "revoke": bool(args.get("revoke"))}), ensure_ascii=False)
 
     return tool_error(f"Unknown action: {action}")

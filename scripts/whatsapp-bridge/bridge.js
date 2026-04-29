@@ -11,6 +11,11 @@
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /typing         - Send typing indicator { chatId }
+ *   POST /presence       - Send presence { chatId, presence }
+ *   POST /read           - Mark message/chat read { chatId, messageId?, participant? }
+ *   POST /react          - React to a message { chatId, messageId, emoji, participant? }
+ *   POST /chat/modify    - Archive/mute/mark unread/star { chatId, action, ... }
+ *   GET  /profile/:id    - Fetch profile/status/business info
  *   GET  /chat/:id       - Get chat info
  *   POST /groups/create  - Create group { subject, participants[] }
  *   POST /groups/subject - Change group name { chatId, subject }
@@ -83,6 +88,33 @@ function normalizeParticipantJid(value) {
   if (raw.includes('@')) return raw;
   const digits = raw.replace(/\D/g, '');
   return digits ? `${digits}@s.whatsapp.net` : '';
+}
+
+function buildMessageKey(chatId, messageId, participant, fromMe = false) {
+  if (!chatId || !messageId) return null;
+  const key = { remoteJid: chatId, id: String(messageId), fromMe: !!fromMe };
+  if (participant) key.participant = normalizeWhatsAppId(participant);
+  return key;
+}
+
+function buildQuotedMessage(chatId, replyTo, participant) {
+  if (!replyTo) return null;
+  if (typeof replyTo === 'object') {
+    const key = replyTo.key || buildMessageKey(
+      replyTo.chatId || chatId,
+      replyTo.messageId || replyTo.id,
+      replyTo.participant || participant,
+      !!replyTo.fromMe,
+    );
+    if (!key?.id) return null;
+    return {
+      key,
+      message: replyTo.message || { conversation: replyTo.text || '' },
+    };
+  }
+  const key = buildMessageKey(chatId, replyTo, participant, false);
+  if (!key?.id) return null;
+  return { key, message: { conversation: '' } };
 }
 
 function normalizeParticipantList(values) {
@@ -603,13 +635,16 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo } = req.body;
+  const { chatId, message, replyTo, replyToParticipant } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
   try {
-    const sent = await sock.sendMessage(chatId, { text: formatOutgoingMessage(message) });
+    const options = {};
+    const quoted = buildQuotedMessage(chatId, replyTo, replyToParticipant);
+    if (quoted) options.quoted = quoted;
+    const sent = await sock.sendMessage(chatId, { text: formatOutgoingMessage(message) }, options);
 
     // Track sent message ID to prevent echo-back loops
     if (sent?.key?.id) {
@@ -670,7 +705,7 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  const { chatId, filePath, mediaType, caption, fileName, ptt, replyTo, replyToParticipant } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
@@ -694,7 +729,7 @@ app.post('/send-media', async (req, res) => {
         break;
       case 'audio': {
         const audioMime = (ext === 'ogg' || ext === 'opus') ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
-        msgPayload = { audio: buffer, mimetype: audioMime, ptt: ext === 'ogg' || ext === 'opus' };
+        msgPayload = { audio: buffer, mimetype: audioMime, ptt: ptt === undefined ? (ext === 'ogg' || ext === 'opus') : !!ptt };
         break;
       }
       case 'document':
@@ -708,7 +743,10 @@ app.post('/send-media', async (req, res) => {
         break;
     }
 
-    const sent = await sock.sendMessage(chatId, msgPayload);
+    const options = {};
+    const quoted = buildQuotedMessage(chatId, replyTo, replyToParticipant);
+    if (quoted) options.quoted = quoted;
+    const sent = await sock.sendMessage(chatId, msgPayload, options);
 
     // Track sent message ID to prevent echo-back loops
     if (sent?.key?.id) {
@@ -741,6 +779,99 @@ app.post('/typing', async (req, res) => {
   }
 });
 
+app.post('/presence', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, presence } = req.body || {};
+  if (!chatId) return res.status(400).json({ error: 'chatId required' });
+  const allowed = new Set(['available', 'unavailable', 'composing', 'recording', 'paused']);
+  const value = String(presence || 'composing').toLowerCase();
+  if (!allowed.has(value)) {
+    return res.status(400).json({ error: 'presence must be one of: available, unavailable, composing, recording, paused' });
+  }
+
+  try {
+    await sock.sendPresenceUpdate(value, chatId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/read', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, messageId, participant } = req.body || {};
+  if (!chatId) return res.status(400).json({ error: 'chatId required' });
+
+  try {
+    if (messageId) {
+      const key = buildMessageKey(chatId, messageId, participant, false);
+      await sock.readMessages([key]);
+    } else {
+      await sock.sendReceipt(chatId, participant || undefined, undefined, 'read');
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/react', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, messageId, participant, emoji } = req.body || {};
+  if (!chatId || !messageId || emoji === undefined) {
+    return res.status(400).json({ error: 'chatId, messageId, and emoji are required' });
+  }
+
+  try {
+    const key = buildMessageKey(chatId, messageId, participant, false);
+    const sent = await sock.sendMessage(chatId, { react: { text: String(emoji || ''), key } });
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/chat/modify', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, action, durationSeconds, messageId, participant } = req.body || {};
+  if (!chatId || !action) return res.status(400).json({ error: 'chatId and action are required' });
+  const normalizedAction = String(action).toLowerCase();
+
+  try {
+    if (normalizedAction === 'archive') {
+      await sock.chatModify({ archive: true }, chatId);
+    } else if (normalizedAction === 'unarchive') {
+      await sock.chatModify({ archive: false }, chatId);
+    } else if (normalizedAction === 'mute') {
+      const muteEndTime = Math.floor(Date.now() / 1000) + Number(durationSeconds || 8 * 60 * 60);
+      await sock.chatModify({ mute: muteEndTime }, chatId);
+    } else if (normalizedAction === 'unmute') {
+      await sock.chatModify({ mute: null }, chatId);
+    } else if (normalizedAction === 'mark_unread') {
+      await sock.chatModify({ markRead: false }, chatId);
+    } else if (normalizedAction === 'mark_read') {
+      await sock.chatModify({ markRead: true }, chatId);
+    } else if (normalizedAction === 'star' || normalizedAction === 'unstar') {
+      if (!messageId) return res.status(400).json({ error: 'messageId is required for star/unstar' });
+      await sock.chatModify({
+        star: {
+          messages: [buildMessageKey(chatId, messageId, participant, false)],
+          star: normalizedAction === 'star',
+        },
+      }, chatId);
+    } else {
+      return res.status(400).json({ error: 'unsupported chat modify action' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Chat info
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;
@@ -766,8 +897,66 @@ app.get('/chat/:id', async (req, res) => {
   });
 });
 
+app.get('/profile/:id', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const jid = req.params.id;
+  try {
+    const [status, pictureUrl, businessProfile] = await Promise.allSettled([
+      sock.fetchStatus(jid),
+      sock.profilePictureUrl(jid, 'image'),
+      sock.getBusinessProfile(jid),
+    ]);
+    res.json({
+      jid,
+      status: status.status === 'fulfilled' ? status.value : null,
+      pictureUrl: pictureUrl.status === 'fulfilled' ? pictureUrl.value : null,
+      businessProfile: businessProfile.status === 'fulfilled' ? businessProfile.value : null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Group/admin operations. These mutate WhatsApp state; callers should apply
 // user-level policy before hitting them.
+app.get('/groups/metadata/:id', async (req, res) => {
+  if (!requireConnected(res)) return;
+  const chatId = req.params.id;
+  if (!requireGroupChatId(chatId, res)) return;
+
+  try {
+    const metadata = await sock.groupMetadata(chatId);
+    res.json({ success: true, metadata });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/join-approval', async (req, res) => {
+  if (!requireConnected(res)) return;
+  const { chatId, participants, action } = req.body || {};
+  if (!requireGroupChatId(chatId, res)) return;
+  const normalizedParticipants = normalizeParticipantList(participants);
+  const normalizedAction = String(action || 'approve').toLowerCase();
+  if (!['approve', 'reject'].includes(normalizedAction)) {
+    return res.status(400).json({ error: 'action must be approve or reject' });
+  }
+  if (normalizedParticipants.length === 0) {
+    return res.status(400).json({ error: 'participants[] is required' });
+  }
+
+  try {
+    if (typeof sock.groupRequestParticipantsUpdate !== 'function') {
+      return res.status(501).json({ error: 'groupRequestParticipantsUpdate is not available in this Baileys build' });
+    }
+    const result = await sock.groupRequestParticipantsUpdate(chatId, normalizedParticipants, normalizedAction);
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/groups/create', async (req, res) => {
   if (!requireConnected(res)) return;
 

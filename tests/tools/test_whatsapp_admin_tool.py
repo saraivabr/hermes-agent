@@ -62,6 +62,7 @@ def test_participants_payload_accepts_single_participant(monkeypatch):
                 "chatId": "120363@g.us",
                 "participant": "+5511999999999",
                 "participantAction": "promote",
+                "confirm": True,
             }
         )
     )
@@ -86,7 +87,23 @@ def test_invite_uses_revoke_flag(monkeypatch):
 
     monkeypatch.setattr("tools.whatsapp_admin_tool._http_json", fake_http)
 
-    result = json.loads(whatsapp_admin_tool({"action": "invite", "chatId": "120363@g.us", "revoke": True}))
+    result = json.loads(whatsapp_admin_tool({"action": "invite", "chatId": "120363@g.us", "revoke": True, "confirm": True}))
 
     assert result["invite"].endswith("example")
     assert calls == [("POST", "/groups/invite", {"chatId": "120363@g.us", "revoke": True}, 30)]
+
+
+def test_mutating_group_actions_require_confirmation():
+    result = json.loads(
+        whatsapp_admin_tool(
+            {
+                "action": "participants",
+                "chatId": "120363@g.us",
+                "participant": "+5511999999999",
+                "participantAction": "remove",
+            }
+        )
+    )
+
+    assert "error" in result
+    assert "confirm=true" in result["error"]
