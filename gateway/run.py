@@ -1922,44 +1922,53 @@ class GatewayRunner:
 
         self._busy_ack_ts[session_key] = now
 
-        # Build a status-rich acknowledgment
-        status_parts = []
-        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            try:
-                summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
-                start_ts = self._running_agents_ts.get(session_key, 0)
-                if start_ts:
-                    elapsed_min = int((now - start_ts) / 60)
-                    if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min")
-                # Simplificado: não expor iteration ao usuário final
-                # if max_iter:
-                #     status_parts.append(f"iteration {iteration}/{max_iter}")
-                if current_tool:
-                    # Humanizar nome da tool
-                    tool_display = current_tool
-                    if current_tool == "terminal":
-                        tool_display = "⌨️ no terminal"
-                    elif current_tool in ("web_search", "browser_navigate", "browser_snapshot"):
-                        tool_display = "🌐 na web"
-                    elif "file" in current_tool or "edit" in current_tool or "write" in current_tool:
-                        tool_display = "📝 editando"
-                    else:
-                        tool_display = f"🛠️ {current_tool}"
-                    status_parts.append(tool_display)
-            except Exception:
-                pass
+        from gateway.status_microcopy import is_whatsapp_platform, render_busy_ack
 
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
-            message = f"↪️ Já vou nisso{status_detail}."
-        elif is_queue_mode:
-            message = f"🕓 Na fila{status_detail}."
+        is_whatsapp = is_whatsapp_platform(event.source.platform)
+        if is_whatsapp:
+            if is_steer_mode:
+                message = render_busy_ack("steer")
+            elif is_queue_mode:
+                message = render_busy_ack("queue")
+            else:
+                message = render_busy_ack("interrupt")
         else:
-            message = f"⚡ Cortando aqui{status_detail}."
+            # Build a status-rich acknowledgment for non-WhatsApp platforms.
+            status_parts = []
+            if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                try:
+                    summary = running_agent.get_activity_summary()
+                    iteration = summary.get("api_call_count", 0)
+                    max_iter = summary.get("max_iterations", 0)
+                    current_tool = summary.get("current_tool")
+                    start_ts = self._running_agents_ts.get(session_key, 0)
+                    if start_ts:
+                        elapsed_min = int((now - start_ts) / 60)
+                        if elapsed_min > 0:
+                            status_parts.append(f"{elapsed_min} min elapsed")
+                    if max_iter:
+                        status_parts.append(f"iteration {iteration}/{max_iter}")
+                    if current_tool:
+                        status_parts.append(f"running: {current_tool}")
+                except Exception:
+                    pass
+
+            status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+            if is_steer_mode:
+                message = (
+                    f"⏩ Steered into current run{status_detail}. "
+                    f"Your message arrives after the next tool call."
+                )
+            elif is_queue_mode:
+                message = (
+                    f"⏳ Queued for the next turn{status_detail}. "
+                    f"I'll respond once the current task finishes."
+                )
+            else:
+                message = (
+                    f"⚡ Interrupting current task{status_detail}. "
+                    f"I'll respond to your message shortly."
+                )
 
         # First-touch onboarding: the very first time a user sends a message
         # while the agent is busy, append a one-time hint explaining the
@@ -1973,7 +1982,7 @@ class GatewayRunner:
                 mark_seen,
             )
             _user_cfg = _load_gateway_config()
-            if not is_seen(_user_cfg, BUSY_INPUT_FLAG):
+            if not is_whatsapp and not is_seen(_user_cfg, BUSY_INPUT_FLAG):
                 if is_steer_mode:
                     _hint_mode = "steer"
                 elif is_queue_mode:
@@ -2052,15 +2061,6 @@ class GatewayRunner:
         if not active:
             return
 
-        action = "reiniciando" if self._restart_requested else "desligando"
-        hint = (
-            "Vai cortar aqui. "
-            "Manda qualquer msg depois que eu tento continuar de onde parei."
-            if self._restart_requested
-            else "Vai cortar aqui."
-        )
-        msg = f"↻ {action.capitalize()} — {hint}"
-
         notified: set = set()
         for session_key in active:
             source = None
@@ -2089,6 +2089,20 @@ class GatewayRunner:
                 platform_str = _parsed["platform"]
                 chat_id = _parsed["chat_id"]
                 thread_id = _parsed.get("thread_id")
+
+            if platform_str == "whatsapp":
+                from gateway.status_microcopy import render_shutdown
+
+                msg = render_shutdown(self._restart_requested)
+            else:
+                action = "restarting" if self._restart_requested else "shutting down"
+                hint = (
+                    "Your current task will be interrupted. "
+                    "Send any message after restart and I'll try to resume where you left off."
+                    if self._restart_requested
+                    else "Your current task will be interrupted."
+                )
+                msg = f"⚠️ Gateway {action} — {hint}"
 
             # Deduplicate: one notification per chat, even if multiple
             # sessions (different users/threads) share the same chat.
@@ -3879,9 +3893,13 @@ class GatewayRunner:
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
+                if source.platform.value == "whatsapp":
+                    from gateway.status_microcopy import render_busy_ack
+
+                    return render_busy_ack("queue", queue_depth=depth)
                 if depth <= 1:
-                    return "🕓 Na fila."
-                return f"🕓 Na fila. ({depth} msgs)"
+                    return "Queued for the next turn."
+                return f"Queued for the next turn. ({depth} queued)"
 
             # /steer <prompt> — inject mid-run after the next tool call.
             # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
@@ -3905,6 +3923,10 @@ class GatewayRunner:
                             channel_prompt=event.channel_prompt,
                         )
                         adapter._pending_messages[_quick_key] = queued_event
+                    if source.platform.value == "whatsapp":
+                        from gateway.status_microcopy import render_busy_ack
+
+                        return render_busy_ack("queue")
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -3913,6 +3935,10 @@ class GatewayRunner:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
                         return f"⚠️ Steer failed: {exc}"
                     if accepted:
+                        if source.platform.value == "whatsapp":
+                            from gateway.status_microcopy import render_busy_ack
+
+                            return render_busy_ack("steer")
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
                     return "Steer rejected (empty payload)."
@@ -3927,6 +3953,10 @@ class GatewayRunner:
                         channel_prompt=event.channel_prompt,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
+                if source.platform.value == "whatsapp":
+                    from gateway.status_microcopy import render_busy_ack
+
+                    return render_busy_ack("queue")
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -4696,18 +4726,24 @@ class GatewayRunner:
                             mins = policy.idle_minutes % 60
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
                             reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"🧼 Sessão limpa ({reason_text}). "
-                            f"Histórico zerado.\n"
-                            f"/resume pra ver sessões antigas.\n"
-                            f"Config em session_reset no config.yaml."
-                        )
-                        try:
-                            session_info = self._format_session_info()
-                            if session_info:
-                                notice = f"{notice}\n\n{session_info}"
-                        except Exception:
-                            pass
+                        if source.platform.value == "whatsapp":
+                            from gateway.status_microcopy import render_session_reset
+
+                            notice = render_session_reset(reason_text)
+                        else:
+                            notice = (
+                                f"◐ Session automatically reset ({reason_text}). "
+                                f"Conversation history cleared.\n"
+                                f"Use /resume to browse and restore a previous session.\n"
+                                f"Adjust reset timing in config.yaml under session_reset."
+                            )
+                        if source.platform.value != "whatsapp":
+                            try:
+                                session_info = self._format_session_info()
+                                if session_info:
+                                    notice = f"{notice}\n\n{session_info}"
+                            except Exception:
+                                pass
                         await adapter.send(
                             source.chat_id, notice,
                             metadata=getattr(event, 'metadata', None),
@@ -8458,6 +8494,10 @@ class GatewayRunner:
             return f"✗ Failed to start update: {e}"
 
         self._schedule_update_notification_watch()
+        if event.source.platform.value == "whatsapp":
+            from gateway.status_microcopy import UPDATE
+
+            return UPDATE
         return "⚕ Starting Hermes update… I'll stream progress here."
 
     def _schedule_update_notification_watch(self) -> None:
@@ -9805,6 +9845,9 @@ class GatewayRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # FELIPE PATCH: never stream partials in group/forum/channel — only final response.
+        if getattr(source, "chat_type", "") in {"group", "forum", "channel"}:
+            _streaming_enabled = False
 
         if source.thread_id:
             _thread_metadata: Optional[Dict[str, Any]] = {"thread_id": source.thread_id}
@@ -10063,6 +10106,13 @@ class GatewayRunner:
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
+        # Keep non-WhatsApp shared spaces quiet; WhatsApp has humanized, short
+        # progress copy and supports editing through the bridge.
+        if (
+            getattr(source, "chat_type", "") in {"group", "forum", "channel"}
+            and getattr(source.platform, "value", source.platform) != "whatsapp"
+        ):
+            progress_mode = "off"
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
@@ -10102,7 +10152,11 @@ class GatewayRunner:
             if event_type == "tool.completed" and not long_tool_hint_fired[0]:
                 try:
                     duration = kwargs.get("duration") or 0
-                    if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
+                    if (
+                        duration >= _LONG_TOOL_THRESHOLD_S
+                        and progress_mode == "all"
+                        and getattr(source.platform, "value", source.platform) != "whatsapp"
+                    ):
                         from agent.onboarding import (
                             TOOL_PROGRESS_FLAG,
                             is_seen,
@@ -10139,11 +10193,24 @@ class GatewayRunner:
             except Exception:
                 pass
 
+            is_whatsapp_progress = getattr(source.platform, "value", source.platform) == "whatsapp"
+            if is_whatsapp_progress:
+                from gateway.status_microcopy import render_tool_progress
+
+                msg = render_tool_progress(tool_name, preview, progress_mode)
+                if msg == last_progress_msg[0]:
+                    return
+                last_tool[0] = tool_name
+                last_progress_msg[0] = msg
+                repeat_count[0] = 0
+                progress_queue.put(msg)
+                return
+
             # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
+
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
@@ -11266,25 +11333,35 @@ class GatewayRunner:
                 return
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
+                _activity = ""
+                _elapsed_mins = int((time.time() - _notify_start) // 60)
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
+                        if source.platform.value == "whatsapp":
+                            _activity = _a.get("current_tool") or _a.get("last_activity_desc", "")
                         else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                            _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
+                            if _a.get("current_tool"):
+                                _parts.append(f"running: {_a['current_tool']}")
+                            else:
+                                _parts.append(_a.get("last_activity_desc", ""))
+                            _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
                 try:
+                    if source.platform.value == "whatsapp":
+                        from gateway.status_microcopy import render_long_running
+
+                        status_text = render_long_running(_activity)
+                    else:
+                        status_text = f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})"
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⚡ Tô nisso... ({_elapsed_mins} min{_status_detail})",
+                        status_text,
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:

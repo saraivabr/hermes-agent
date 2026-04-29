@@ -2466,16 +2466,34 @@ class BasePlatformAdapter(ABC):
                         except OSError:
                             pass
 
-                # Send the text portion
+                # Send the text portion (humanized split for chat platforms)
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=event.message_id,
-                        metadata=_thread_metadata,
+                    _split_enabled = (
+                        os.getenv("HERMES_SPLIT_MESSAGES", "on").lower() != "off"
+                        and self.name.lower() in {"whatsapp", "telegram", "discord"}
                     )
-                    _record_delivery(result)
+                    _chunks = []
+                    if _split_enabled:
+                        _raw = text_content.replace("[[split]]", "\n\n")
+                        for _part in re.split(r"\n\s*\n+", _raw.strip()):
+                            _part = _part.strip()
+                            if _part:
+                                _chunks.append(_part)
+                    if not _chunks:
+                        _chunks = [text_content]
+                    _intra_delay = self._get_human_delay()
+                    for _i, _chunk in enumerate(_chunks):
+                        if _i > 0 and _intra_delay > 0:
+                            await asyncio.sleep(_intra_delay)
+                            _intra_delay = self._get_human_delay()
+                        result = await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=_chunk,
+                            reply_to=event.message_id if _i == 0 else None,
+                            metadata=_thread_metadata,
+                        )
+                        _record_delivery(result)
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()

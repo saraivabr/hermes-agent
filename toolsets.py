@@ -56,8 +56,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
-    # Cross-platform messaging (gated on gateway running via check_fn)
-    "send_message",
+    # Cross-platform messaging + WhatsApp bridge admin (gated on gateway/bridge checks)
+    "send_message", "whatsapp_admin",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
@@ -128,8 +128,8 @@ TOOLSETS = {
     },
     
     "messaging": {
-        "description": "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
-        "tools": ["send_message"],
+        "description": "Cross-platform messaging plus WhatsApp bridge history and group/admin control",
+        "tools": ["send_message", "whatsapp_admin"],
         "includes": []
     },
     

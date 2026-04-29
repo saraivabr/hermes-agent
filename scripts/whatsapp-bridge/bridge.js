@@ -12,6 +12,13 @@
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
+ *   POST /groups/create  - Create group { subject, participants[] }
+ *   POST /groups/subject - Change group name { chatId, subject }
+ *   POST /groups/photo   - Change group photo { chatId, filePath }
+ *   POST /groups/participants - Add/remove/promote/demote { chatId, participants[], action }
+ *   POST /groups/description - Change group description { chatId, description }
+ *   POST /groups/settings - Change group settings { chatId, setting }
+ *   POST /groups/invite  - Get/revoke invite link { chatId, revoke? }
  *   GET  /health         - Health check
  *
  * Usage:
@@ -23,7 +30,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync } from 'fs';
 import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
@@ -46,6 +53,8 @@ const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.herme
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+const HISTORY_DIR = getArg('history', process.env.WHATSAPP_HISTORY_DIR || path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'history'));
+const HISTORY_FILE = path.join(HISTORY_DIR, 'messages.jsonl');
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -65,6 +74,36 @@ function formatOutgoingMessage(message) {
 function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
+}
+
+function normalizeParticipantJid(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (raw.endsWith('@s.whatsapp.net') || raw.endsWith('@lid')) return raw;
+  if (raw.includes('@')) return raw;
+  const digits = raw.replace(/\D/g, '');
+  return digits ? `${digits}@s.whatsapp.net` : '';
+}
+
+function normalizeParticipantList(values) {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values.map(normalizeParticipantJid).filter(Boolean))];
+}
+
+function requireConnected(res) {
+  if (!sock || connectionState !== 'connected') {
+    res.status(503).json({ error: 'Not connected to WhatsApp' });
+    return false;
+  }
+  return true;
+}
+
+function requireGroupChatId(chatId, res) {
+  if (!chatId || !String(chatId).endsWith('@g.us')) {
+    res.status(400).json({ error: 'Valid WhatsApp group chatId ending in @g.us is required' });
+    return false;
+  }
+  return true;
 }
 
 function getMessageContent(msg) {
@@ -90,6 +129,116 @@ function getContextInfo(messageContent) {
 }
 
 mkdirSync(SESSION_DIR, { recursive: true });
+mkdirSync(HISTORY_DIR, { recursive: true });
+
+function loadStoredMessageIds() {
+  const ids = new Set();
+  if (!existsSync(HISTORY_FILE)) return ids;
+  try {
+    const raw = readFileSync(HISTORY_FILE, 'utf8');
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const rec = JSON.parse(line);
+        if (rec?.messageId) ids.add(String(rec.messageId));
+      } catch {}
+    }
+  } catch (err) {
+    console.error('[bridge] Failed to load WhatsApp history index:', err.message);
+  }
+  return ids;
+}
+
+const storedMessageIds = loadStoredMessageIds();
+
+function normalizeTimestamp(ts) {
+  if (!ts) return Math.floor(Date.now() / 1000);
+  if (typeof ts === 'number') return ts;
+  if (typeof ts === 'string') {
+    const n = Number(ts);
+    return Number.isFinite(n) ? n : Math.floor(Date.now() / 1000);
+  }
+  if (typeof ts === 'object') {
+    if (typeof ts.low === 'number') return ts.low;
+    if (typeof ts.toNumber === 'function') {
+      try { return ts.toNumber(); } catch {}
+    }
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+function storeHistoryEvent(event) {
+  if (!event?.messageId) return;
+  if (storedMessageIds.has(String(event.messageId))) return;
+  const record = {
+    schemaVersion: 1,
+    capturedAt: new Date().toISOString(),
+    messageId: event.messageId,
+    chatId: event.chatId,
+    chatName: event.chatName,
+    isGroup: !!event.isGroup,
+    senderId: event.senderId,
+    senderName: event.senderName,
+    body: event.body || '',
+    hasMedia: !!event.hasMedia,
+    mediaType: event.mediaType || '',
+    mediaUrls: event.mediaUrls || [],
+    mentionedIds: event.mentionedIds || [],
+    quotedParticipant: event.quotedParticipant || '',
+    fromMe: !!event.fromMe,
+    timestamp: normalizeTimestamp(event.timestamp),
+  };
+  try {
+    appendFileSync(HISTORY_FILE, `${JSON.stringify(record)}\n`, 'utf8');
+    storedMessageIds.add(String(event.messageId));
+  } catch (err) {
+    console.error('[bridge] Failed to store WhatsApp history event:', err.message);
+  }
+}
+
+function readHistoryRecords({ chatId, q, limit = 100, before, after, isGroup } = {}) {
+  if (!existsSync(HISTORY_FILE)) return [];
+  const max = Math.max(1, Math.min(parseInt(limit || 100, 10) || 100, 1000));
+  const query = q ? String(q).toLowerCase() : '';
+  const beforeTs = before ? Number(before) : null;
+  const afterTs = after ? Number(after) : null;
+  const out = [];
+  try {
+    const lines = readFileSync(HISTORY_FILE, 'utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      if (chatId && rec.chatId !== chatId) continue;
+      if (isGroup !== undefined && String(rec.isGroup) !== String(isGroup)) continue;
+      if (query) {
+        const haystack = `${rec.body || ''} ${rec.senderName || ''} ${rec.chatName || ''}`.toLowerCase();
+        if (!haystack.includes(query)) continue;
+      }
+      if (Number.isFinite(beforeTs) && !(Number(rec.timestamp) < beforeTs)) continue;
+      if (Number.isFinite(afterTs) && !(Number(rec.timestamp) > afterTs)) continue;
+      out.push(rec);
+      if (out.length >= max) break;
+    }
+  } catch (err) {
+    console.error('[bridge] Failed to read WhatsApp history:', err.message);
+  }
+  return out.reverse();
+}
+
+function listHistoryChats() {
+  const byChat = new Map();
+  for (const rec of readHistoryRecords({ limit: 1000 })) {
+    const prev = byChat.get(rec.chatId) || { chatId: rec.chatId, chatName: rec.chatName, isGroup: rec.isGroup, messageCount: 0, lastTimestamp: 0 };
+    prev.chatName = rec.chatName || prev.chatName;
+    prev.isGroup = rec.isGroup;
+    prev.messageCount += 1;
+    prev.lastTimestamp = Math.max(prev.lastTimestamp || 0, Number(rec.timestamp) || 0);
+    byChat.set(rec.chatId, prev);
+  }
+  return Array.from(byChat.values()).sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0));
+}
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
 function buildLidMap() {
@@ -130,7 +279,9 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    // Best-effort backfill: ask WhatsApp/Baileys for full history when the
+    // linked-device session allows it. WhatsApp may still return only a subset.
+    syncFullHistory: process.env.WHATSAPP_SYNC_FULL_HISTORY === 'false' ? false : true,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -350,6 +501,7 @@ async function startSocket() {
         senderName: msg.pushName || senderNumber,
         chatName: isGroup ? (chatId.split('@')[0]) : (msg.pushName || senderNumber),
         isGroup,
+        fromMe: !!msg.key.fromMe,
         body,
         hasMedia,
         mediaType,
@@ -359,6 +511,8 @@ async function startSocket() {
         botIds,
         timestamp: msg.messageTimestamp,
       };
+
+      storeHistoryEvent(event);
 
       messageQueue.push(event);
       if (messageQueue.length > MAX_QUEUE_SIZE) {
@@ -407,6 +561,40 @@ app.use((req, res, next) => {
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
   res.json(msgs);
+});
+
+// List chats observed in the local WhatsApp history store.
+app.get('/history/chats', (req, res) => {
+  res.json({ chats: listHistoryChats(), historyFile: HISTORY_FILE });
+});
+
+// Read locally stored WhatsApp history. Query params:
+//   chatId, q, limit, before, after, isGroup
+app.get('/history', (req, res) => {
+  const { chatId, q, limit, before, after, isGroup } = req.query || {};
+  const records = readHistoryRecords({
+    chatId: chatId ? String(chatId) : undefined,
+    q: q ? String(q) : undefined,
+    limit: limit ? Number(limit) : 100,
+    before: before ? Number(before) : undefined,
+    after: after ? Number(after) : undefined,
+    isGroup: isGroup === undefined ? undefined : String(isGroup) === 'true',
+  });
+  res.json({ count: records.length, messages: records, historyFile: HISTORY_FILE });
+});
+
+// Convenience alias for text search.
+app.get('/search', (req, res) => {
+  const { chatId, q, limit, before, after, isGroup } = req.query || {};
+  const records = readHistoryRecords({
+    chatId: chatId ? String(chatId) : undefined,
+    q: q ? String(q) : '',
+    limit: limit ? Number(limit) : 100,
+    before: before ? Number(before) : undefined,
+    after: after ? Number(after) : undefined,
+    isGroup: isGroup === undefined ? undefined : String(isGroup) === 'true',
+  });
+  res.json({ count: records.length, messages: records, historyFile: HISTORY_FILE });
 });
 
 // Send a message
@@ -576,6 +764,129 @@ app.get('/chat/:id', async (req, res) => {
     isGroup,
     participants: [],
   });
+});
+
+// Group/admin operations. These mutate WhatsApp state; callers should apply
+// user-level policy before hitting them.
+app.post('/groups/create', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { subject, participants } = req.body || {};
+  const normalizedParticipants = normalizeParticipantList(participants);
+  if (!subject || normalizedParticipants.length === 0) {
+    return res.status(400).json({ error: 'subject and participants[] are required' });
+  }
+
+  try {
+    const group = await sock.groupCreate(String(subject), normalizedParticipants);
+    res.json({ success: true, group });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/subject', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, subject } = req.body || {};
+  if (!requireGroupChatId(chatId, res)) return;
+  if (!subject) return res.status(400).json({ error: 'subject is required' });
+
+  try {
+    await sock.groupUpdateSubject(chatId, String(subject));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/description', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, description } = req.body || {};
+  if (!requireGroupChatId(chatId, res)) return;
+
+  try {
+    await sock.groupUpdateDescription(chatId, description ? String(description) : undefined);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/photo', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, filePath } = req.body || {};
+  if (!requireGroupChatId(chatId, res)) return;
+  if (!filePath) return res.status(400).json({ error: 'filePath is required' });
+
+  try {
+    if (!existsSync(filePath)) {
+      return res.status(404).json({ error: `File not found: ${filePath}` });
+    }
+    const buffer = readFileSync(filePath);
+    await sock.updateProfilePicture(chatId, buffer);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/participants', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, participants, action } = req.body || {};
+  if (!requireGroupChatId(chatId, res)) return;
+  const normalizedParticipants = normalizeParticipantList(participants);
+  const normalizedAction = String(action || 'add').toLowerCase();
+  const allowedActions = new Set(['add', 'remove', 'promote', 'demote']);
+  if (!allowedActions.has(normalizedAction)) {
+    return res.status(400).json({ error: 'action must be one of: add, remove, promote, demote' });
+  }
+  if (normalizedParticipants.length === 0) {
+    return res.status(400).json({ error: 'participants[] is required' });
+  }
+
+  try {
+    const result = await sock.groupParticipantsUpdate(chatId, normalizedParticipants, normalizedAction);
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/settings', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, setting } = req.body || {};
+  if (!requireGroupChatId(chatId, res)) return;
+  const normalizedSetting = String(setting || '').toLowerCase();
+  const allowedSettings = new Set(['announcement', 'not_announcement', 'locked', 'unlocked']);
+  if (!allowedSettings.has(normalizedSetting)) {
+    return res.status(400).json({ error: 'setting must be one of: announcement, not_announcement, locked, unlocked' });
+  }
+
+  try {
+    await sock.groupSettingUpdate(chatId, normalizedSetting);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/invite', async (req, res) => {
+  if (!requireConnected(res)) return;
+
+  const { chatId, revoke } = req.body || {};
+  if (!requireGroupChatId(chatId, res)) return;
+
+  try {
+    const code = revoke ? await sock.groupRevokeInvite(chatId) : await sock.groupInviteCode(chatId);
+    res.json({ success: true, code, inviteUrl: `https://chat.whatsapp.com/${code}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Health check
