@@ -217,6 +217,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
             "Respond only to the request that mentioned you; keep it brief, professional, and group-safe."
         )
 
+    def _whatsapp_human_style_prompt(self) -> str:
+        return (
+            "WhatsApp style: speak naturally and briefly. "
+            "Never call the system Hermes; if a product/system name is needed, say EMPRESA.IA. "
+            "Do not narrate internal tests, shell markers, dry-runs, implementation steps, or restart mechanics unless the user explicitly asks. "
+            "Let the status message carry operational progress; keep the final reply about the user's outcome."
+        )
+
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
         """Parse allow_from / group_allow_from from config or env var."""
@@ -1329,7 +1337,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
-            channel_prompt = None
+            channel_prompt = self._whatsapp_human_style_prompt()
             if is_group:
                 chat_id = str(data.get("chatId") or "")
                 configured_prompt = resolve_channel_prompt(
@@ -1351,7 +1359,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         self._human_policy.context_limit(chat_type=chat_type, chat_id=chat_id),
                     )
                 channel_prompt = "\n\n".join(
-                    part for part in (configured_prompt, group_guard, recent_context) if part
+                    part for part in (channel_prompt, configured_prompt, group_guard, recent_context) if part
                 )
 
             return MessageEvent(

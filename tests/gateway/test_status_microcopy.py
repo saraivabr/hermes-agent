@@ -83,6 +83,13 @@ def test_tool_progress_extracts_practical_safe_targets():
     assert render_tool_progress("terminal", "curl https://example.com/docs?token=secret") == GENERIC_TOOL
 
 
+def test_tool_progress_hides_ugly_or_old_brand_commands():
+    assert render_tool_progress("terminal", "hermes gateway status") == "⌨️ Rodando EMPRESA.IA"
+    assert render_tool_progress("terminal", "python -m hermes_cli.main gateway status") == "⌨️ Rodando EMPRESA.IA"
+    assert render_tool_progress("terminal", "true") == "⚙️ Validando."
+    assert render_tool_progress("terminal", "systemctl restart hermes-gateway.service") == "↻ Reiniciando ponte"
+
+
 def test_tool_progress_sanitizes_private_or_noisy_values():
     msg = render_tool_progress("read_file", "/home/ubuntu/.hermes/hermes-agent/gateway/run.py")
     assert msg == "🔎 Lendo run.py"

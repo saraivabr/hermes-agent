@@ -69,6 +69,8 @@ _RUN_COMMANDS = {
     "docker-compose",
     "make",
 }
+_BRAND_COMMANDS = {"hermes", "hermes_cli.main"}
+_NOISY_CHECK_COMMANDS = {"true", "false", "test", "[", "echo", "printf", "sleep"}
 _SECRETISH_RE = re.compile(
     r"(?i)(token|secret|password|passwd|authorization|bearer|api[_-]?key|session|cookie|credential|private)"
 )
@@ -127,7 +129,13 @@ def compact_command_label(command: str | None) -> str | None:
     cmd = os.path.basename(parts[0])
     if cmd in {"sudo", "env", "command", "timeout"} and len(parts) > 1:
         cmd = os.path.basename(parts[1])
+    if cmd in _BRAND_COMMANDS:
+        return "EMPRESA.IA"
+    if cmd in _NOISY_CHECK_COMMANDS:
+        return "checagem"
     if cmd in {"python", "python3"} and len(parts) >= 3 and parts[1] == "-m":
+        if parts[2] in _BRAND_COMMANDS or parts[2].startswith("hermes_"):
+            return "EMPRESA.IA"
         return parts[2][:28]
     if cmd == "ssh":
         return "servidor"
@@ -178,6 +186,13 @@ def classify_tool_action(tool_name: str | None, preview: str | None = None) -> t
 
     command = compact_command_label(preview)
     if name in _TERMINAL_TOOLS and command:
+        preview_text = str(preview or "").lower()
+        if command == "checagem":
+            return "⚙️", "Validando", None
+        if command == "EMPRESA.IA":
+            return "⌨️", "Rodando", "EMPRESA.IA"
+        if command == "systemctl" and any(word in preview_text for word in ("restart", "stop")) and "gateway" in preview_text:
+            return "↻", "Reiniciando", "ponte"
         if command in _READ_COMMANDS:
             return "🔎", "Lendo", target
         if command in _EDIT_COMMANDS:
@@ -208,7 +223,9 @@ def _compact_status(icon: str, verb: str, target: str | None) -> str:
             return "📨 Enviando."
         if icon == "↪️":
             return "↪️ Puxando ajuda."
-        return GENERIC_TOOL if icon == "⚙️" else f"{icon} {verb}."
+        if icon == "⚙️" and verb == "Rodando":
+            return GENERIC_TOOL
+        return f"{icon} {verb}."
     if icon == "↪️" and target == "ajuda":
         return "↪️ Puxando ajuda."
     msg = f"{icon} {verb} {target}"
