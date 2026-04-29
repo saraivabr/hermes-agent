@@ -220,7 +220,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
     def _whatsapp_human_style_prompt(self) -> str:
         return (
             "WhatsApp style: speak naturally and briefly. "
-            "Never call the system Hermes; if a product/system name is needed, say EMPRESA.IA. "
+            "Never use the old product name; if a product/system name is needed, say EMPRESA.IA. "
             "Do not narrate internal tests, shell markers, dry-runs, implementation steps, or restart mechanics unless the user explicitly asks. "
             "Let the status message carry operational progress; keep the final reply about the user's outcome."
         )

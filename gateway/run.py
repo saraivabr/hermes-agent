@@ -8514,7 +8514,7 @@ class GatewayRunner:
             from gateway.status_microcopy import UPDATE
 
             return UPDATE
-        return "⚕ Starting EMPRESA.IA update… I'll stream progress here."
+        return "↻ Atualizando EMPRESA.IA."
 
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
@@ -8633,9 +8633,9 @@ class GatewayRunner:
                     exit_code_raw = exit_code_path.read_text().strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
-                        await adapter.send(chat_id, "✅ EMPRESA.IA update finished.")
+                        await adapter.send(chat_id, "✅ EMPRESA.IA atualizada.")
                     else:
-                        await adapter.send(chat_id, "❌ EMPRESA.IA update failed (exit code {}).".format(exit_code))
+                        await adapter.send(chat_id, "❌ Atualização da EMPRESA.IA falhou ({})".format(exit_code))
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
                     logger.warning("Update final notification failed: %s", e)
@@ -8690,13 +8690,13 @@ class GatewayRunner:
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
-                            default_hint = f" (default: {default})" if default else ""
+                            default_hint = f" (padrão: {default})" if default else ""
                             await adapter.send(
                                 chat_id,
-                                f"⚕ **Update needs your input:**\n\n"
+                                f"⚕ **Atualização precisa de resposta:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
-                                f"Reply `/approve` (yes) or `/deny` (no), "
-                                f"or type your answer directly."
+                                f"Responda `/approve` (sim), `/deny` (não), "
+                                f"ou escreva a resposta direto."
                             )
                         self._update_prompt_pending[session_key] = True
                         # Remove the prompt file so it isn't re-read on the
@@ -8716,7 +8716,7 @@ class GatewayRunner:
             exit_code_path.write_text("124")
             await _flush_buffer()
             try:
-                await adapter.send(chat_id, "❌ EMPRESA.IA update timed out after 30 minutes.")
+                await adapter.send(chat_id, "❌ Atualização da EMPRESA.IA passou de 30 minutos.")
             except Exception:
                 pass
             for p in (pending_path, claimed_path, output_path,
@@ -8785,14 +8785,14 @@ class GatewayRunner:
                     if len(output) > 3500:
                         output = "…" + output[-3500:]
                     if exit_code == 0:
-                        msg = f"✅ EMPRESA.IA update finished.\n\n```\n{output}\n```"
+                        msg = f"✅ EMPRESA.IA atualizada.\n\n```\n{output}\n```"
                     else:
-                        msg = f"❌ EMPRESA.IA update failed.\n\n```\n{output}\n```"
+                        msg = f"❌ Atualização da EMPRESA.IA falhou.\n\n```\n{output}\n```"
                 else:
                     if exit_code == 0:
-                        msg = "✅ EMPRESA.IA update finished successfully."
+                        msg = "✅ EMPRESA.IA atualizada."
                     else:
-                        msg = "❌ EMPRESA.IA update failed. Check the gateway logs or run `hermes update` manually for details."
+                        msg = "❌ Atualização da EMPRESA.IA falhou. Veja os logs do gateway."
                 await adapter.send(chat_id, msg)
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
@@ -12134,8 +12134,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         else:
             _signal_initiated_shutdown = True
             logger.info("Received SIGTERM/SIGINT — initiating shutdown")
-        # Diagnostic: log all hermes-related processes so we can identify
-        # what triggered the signal (hermes update, hermes gateway restart,
+        # Diagnostic: log all gateway-related processes so we can identify
+        # what triggered the signal (update, gateway restart,
         # a stale detached subprocess, etc.).
         try:
             import subprocess as _sp
@@ -12150,11 +12150,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             ]
             if _hermes_procs:
                 logger.warning(
-                    "Shutdown diagnostic — other hermes processes running:\n  %s",
+                    "Shutdown diagnostic — other gateway processes running:\n  %s",
                     "\n  ".join(_hermes_procs),
                 )
             else:
-                logger.info("Shutdown diagnostic — no other hermes processes found")
+                logger.info("Shutdown diagnostic — no other gateway processes found")
         except Exception:
             pass
         asyncio.create_task(runner.stop())
