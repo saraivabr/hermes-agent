@@ -1,4 +1,4 @@
-"""Safe infrastructure target registry for Hermes.
+"""Safe infrastructure target registry for EMPRESA.IA.
 
 The registry references local credential mechanisms (SSH config, AWS profiles,
 Scalingo CLI) without reading or storing secret material.
