@@ -17,6 +17,30 @@ from gateway.status_microcopy import (
 )
 
 
+GENERIC_TOOL_VARIANTS = {
+    "⚡ Tô nisso.",
+    "🕯️ Com calma.",
+    "🛠️ Preparando.",
+    "📜 Conferindo.",
+    "⚙️ Em obra.",
+}
+MODEL_WAITING_VARIANTS = {
+    "🧠 IA pensando.",
+    "🕯️ Pensando aqui.",
+    "📜 Formando resposta.",
+}
+LONG_RUNNING_VARIANTS = {
+    "⚡ Ainda nisso.",
+    "🕯️ Sem pressa.",
+    "📜 Discernindo.",
+}
+VALIDATING_VARIANTS = {
+    "⚙️ Validando.",
+    "📜 Conferindo.",
+    "🕯️ Checando.",
+}
+
+
 class _DummyAdapter:
     def __init__(self):
         self._pending_messages = {}
@@ -59,9 +83,9 @@ def test_alert_and_reset_copy_is_ptbr():
 
 
 def test_long_running_maps_model_wait_to_ptbr():
-    assert render_long_running("waiting for non-streaming API response") == "🧠 IA pensando."
-    assert render_long_running("receiving stream response") == "🧠 IA pensando."
-    assert render_long_running("executing tool: terminal") == "⚡ Ainda nisso."
+    assert render_long_running("waiting for non-streaming API response") in MODEL_WAITING_VARIANTS
+    assert render_long_running("receiving stream response") in MODEL_WAITING_VARIANTS
+    assert render_long_running("executing tool: terminal") in LONG_RUNNING_VARIANTS
 
 
 def test_tool_progress_humanizes_tool_names():
@@ -72,7 +96,7 @@ def test_tool_progress_humanizes_tool_names():
     assert render_tool_progress("write_file", "file.py") == "🩹 Editando file.py"
     assert render_tool_progress("send_message", "whatsapp:x") == "📨 Enviando."
     assert render_tool_progress("delegate_task", "goal") == "↪️ Puxando ajuda."
-    assert render_tool_progress("unknown_tool", "raw internals") == GENERIC_TOOL
+    assert render_tool_progress("unknown_tool", "raw internals") in GENERIC_TOOL_VARIANTS
 
 
 def test_tool_progress_extracts_practical_safe_targets():
@@ -80,13 +104,13 @@ def test_tool_progress_extracts_practical_safe_targets():
     assert render_tool_progress("apply_patch", "gateway/status_microcopy.py") == "🩹 Editando status_microcopy.py"
     assert render_tool_progress("terminal", "pytest tests/gateway/test_status_microcopy.py") == "⌨️ Rodando pytest"
     assert render_tool_progress("terminal", "python -m py_compile gateway/run.py") == "⌨️ Rodando py_compile"
-    assert render_tool_progress("terminal", "curl https://example.com/docs?token=secret") == GENERIC_TOOL
+    assert render_tool_progress("terminal", "curl https://example.com/docs?token=secret") in GENERIC_TOOL_VARIANTS
 
 
 def test_tool_progress_hides_ugly_or_old_brand_commands():
     assert render_tool_progress("terminal", "hermes gateway status") == "⌨️ Rodando EMPRESA.IA"
     assert render_tool_progress("terminal", "python -m hermes_cli.main gateway status") == "⌨️ Rodando EMPRESA.IA"
-    assert render_tool_progress("terminal", "true") == "⚙️ Validando."
+    assert render_tool_progress("terminal", "true") in VALIDATING_VARIANTS
     assert render_tool_progress("terminal", "systemctl restart hermes-gateway.service") == "↻ Reiniciando ponte"
 
 
@@ -97,7 +121,7 @@ def test_tool_progress_sanitizes_private_or_noisy_values():
     assert ".hermes" not in msg
 
     secret_msg = render_tool_progress("terminal", "curl https://api.local/path?api_key=abcd1234")
-    assert secret_msg == GENERIC_TOOL
+    assert secret_msg in GENERIC_TOOL_VARIANTS
     assert "api_key" not in secret_msg
     assert "abcd1234" not in secret_msg
 

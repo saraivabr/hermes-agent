@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from collections import defaultdict
 
 
 BUSY_QUEUE = "🕓 Na fila."
@@ -21,6 +22,31 @@ RESTARTING_BUSY = "↻ Reiniciando. Já volto."
 SHUTTING_DOWN_BUSY = "⚠️ Fechando a ponte."
 INTERRUPTED_MODEL = "⚠️ Interrompido na resposta."
 _MAX_STATUS_LEN = 45
+
+_ROTATION_COUNTERS: dict[str, int] = defaultdict(int)
+
+_GENERIC_TOOL_VARIANTS = (
+    "⚡ Tô nisso.",
+    "🕯️ Com calma.",
+    "🛠️ Preparando.",
+    "📜 Conferindo.",
+    "⚙️ Em obra.",
+)
+_VALIDATING_VARIANTS = (
+    "⚙️ Validando.",
+    "📜 Conferindo.",
+    "🕯️ Checando.",
+)
+_LONG_RUNNING_VARIANTS = (
+    "⚡ Ainda nisso.",
+    "🕯️ Sem pressa.",
+    "📜 Discernindo.",
+)
+_MODEL_WAITING_VARIANTS = (
+    "🧠 IA pensando.",
+    "🕯️ Pensando aqui.",
+    "📜 Formando resposta.",
+)
 
 _MODEL_ACTIVITY_HINTS = (
     "api",
@@ -91,6 +117,15 @@ def render_busy_ack(mode: str, queue_depth: int | None = None) -> str:
     if mode == "interrupt":
         return BUSY_INTERRUPT
     return BUSY_QUEUE
+
+
+def _rotate(bucket: str, variants: tuple[str, ...]) -> str:
+    """Return the next short status for a bucket without using randomness."""
+    if not variants:
+        return ""
+    index = _ROTATION_COUNTERS[bucket] % len(variants)
+    _ROTATION_COUNTERS[bucket] += 1
+    return variants[index]
 
 
 def compact_file_label(path: str | None) -> str | None:
@@ -223,8 +258,10 @@ def _compact_status(icon: str, verb: str, target: str | None) -> str:
             return "📨 Enviando."
         if icon == "↪️":
             return "↪️ Puxando ajuda."
+        if icon == "⚙️" and verb == "Validando":
+            return _rotate("validating", _VALIDATING_VARIANTS)
         if icon == "⚙️" and verb == "Rodando":
-            return GENERIC_TOOL
+            return _rotate("generic_tool", _GENERIC_TOOL_VARIANTS)
         return f"{icon} {verb}."
     if icon == "↪️" and target == "ajuda":
         return "↪️ Puxando ajuda."
@@ -245,8 +282,8 @@ def render_long_running(activity: str | None = None) -> str:
     """Render a heartbeat status from internal activity text."""
     text = str(activity or "").lower()
     if any(hint in text for hint in _MODEL_ACTIVITY_HINTS):
-        return MODEL_WAITING
-    return LONG_RUNNING
+        return _rotate("model_waiting", _MODEL_WAITING_VARIANTS)
+    return _rotate("long_running", _LONG_RUNNING_VARIANTS)
 
 
 def render_shutdown(restarting: bool) -> str:
