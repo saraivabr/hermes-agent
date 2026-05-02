@@ -5856,6 +5856,27 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
+        if source.platform == Platform.WHATSAPP and adapter and hasattr(adapter, "get_bridge_health"):
+            try:
+                bridge = await adapter.get_bridge_health()
+                reconnects = bridge.get("reconnects") if isinstance(bridge, dict) else None
+                free_count = len(bridge.get("freeResponseChats") or []) if isinstance(bridge, dict) else 0
+                mode_count = len(bridge.get("responseModeByChat") or {}) if isinstance(bridge, dict) else 0
+                lines.extend([
+                    "",
+                    "**WhatsApp:**",
+                    f"- Bridge: {bridge.get('status', 'unknown')}",
+                    f"- Queue: {bridge.get('queueLength', 0)}",
+                    f"- Reactions: {bridge.get('reactionMode', 'alerts')}",
+                    f"- Free groups: {free_count}",
+                    f"- Chat modes: {mode_count}",
+                ])
+                if reconnects:
+                    lines.append(f"- Reconnects: {reconnects}")
+                if bridge.get("lastDisconnectReason"):
+                    lines.append(f"- Last disconnect: {bridge.get('lastDisconnectReason')}")
+            except Exception as exc:
+                logger.debug("WhatsApp bridge status failed: %s", exc)
 
         return "\n".join(lines)
 

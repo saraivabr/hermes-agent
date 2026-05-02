@@ -741,6 +741,17 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
+                for key in ("response_mode_by_chat", "context_digest"):
+                    if key in whatsapp_cfg:
+                        plat_data = platforms_data.setdefault(Platform.WHATSAPP.value, {})
+                        if not isinstance(plat_data, dict):
+                            plat_data = {}
+                            platforms_data[Platform.WHATSAPP.value] = plat_data
+                        extra = plat_data.setdefault("extra", {})
+                        if not isinstance(extra, dict):
+                            extra = {}
+                            plat_data["extra"] = extra
+                        extra[key] = whatsapp_cfg[key]
                 if "dm_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_DM_POLICY"):
                     os.environ["WHATSAPP_DM_POLICY"] = str(whatsapp_cfg["dm_policy"]).lower()
                 af = whatsapp_cfg.get("allow_from")

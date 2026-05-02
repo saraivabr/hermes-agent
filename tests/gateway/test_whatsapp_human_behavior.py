@@ -48,6 +48,18 @@ class _HookAdapter(WhatsAppAdapter):
         return {"success": True}
 
 
+class _DigestAdapter(_HookAdapter):
+    def __init__(self, messages):
+        super().__init__()
+        self.messages = messages
+
+    async def _bridge_request(self, method, path, *, json_payload=None, timeout_seconds=30):
+        self.calls.append((method, path, json_payload))
+        if method == "GET" and path.startswith("/history?"):
+            return {"messages": self.messages}
+        return {"success": True}
+
+
 def test_processing_hooks_default_to_read_receipts_without_success_reactions():
     adapter = _HookAdapter()
     source = SessionSource(platform=Platform.WHATSAPP, chat_id="120@g.us", chat_type="group", user_id="u")
@@ -109,6 +121,56 @@ def test_reaction_mode_all_preserves_legacy_lifecycle_reactions():
 
     assert ("POST", "/react", {"chatId": "120@g.us", "messageId": "MSG1", "emoji": "👀", "participant": "5511999999999@s.whatsapp.net"}) in adapter.calls
     assert ("POST", "/react", {"chatId": "120@g.us", "messageId": "MSG1", "emoji": "✅", "participant": "5511999999999@s.whatsapp.net"}) in adapter.calls
+
+
+def test_context_digest_is_scoped_by_chat_and_sanitized(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter = _DigestAdapter([
+        {
+            "chatId": "120@g.us",
+            "senderName": "Felipe",
+            "body": "vamos vender pelo WhatsApp https://x.test?a=token",
+        },
+        {
+            "chatId": "999@g.us",
+            "senderName": "Outro",
+            "body": "não pode entrar",
+        },
+        {
+            "chatId": "120@g.us",
+            "senderName": "5511999999999@s.whatsapp.net",
+            "body": "meu telefone é +55 11 99999-9999",
+        },
+    ])
+
+    asyncio.run(adapter._update_context_digest("120@g.us", "group"))
+    prompt = adapter._render_context_digest_prompt("120@g.us")
+    other_prompt = adapter._render_context_digest_prompt("999@g.us")
+
+    assert "vender pelo WhatsApp" in prompt
+    assert "[link]" in prompt
+    assert "[telefone]" in prompt
+    assert "não pode entrar" not in prompt
+    assert other_prompt == ""
+
+
+def test_processing_complete_updates_digest_on_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    adapter = _DigestAdapter([
+        {"chatId": "120@g.us", "senderName": "Saraiva", "body": "continua o plano"},
+    ])
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id="120@g.us", chat_type="group", user_id="u")
+    event = MessageEvent(
+        text="continua",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="MSG1",
+        raw_message={"senderId": "5511999999999@s.whatsapp.net"},
+    )
+
+    asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+
+    assert "continua o plano" in adapter._render_context_digest_prompt("120@g.us")
 
 
 def test_whatsapp_keep_typing_stops_typing_after_finite_sequence(monkeypatch):

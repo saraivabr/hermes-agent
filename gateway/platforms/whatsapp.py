@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from hermes_constants import get_hermes_dir
+from hermes_constants import get_hermes_dir, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
     - allow_from: List of sender IDs allowed in DMs (when dm_policy="allowlist")
     - group_policy: "open" | "allowlist" | "disabled" — which groups are processed (default: "open")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
+    - response_mode_by_chat: Map group JID to "mention_only", "persona_free", or "silent"
+      (legacy free_response_chats are treated as persona_free)
     - reaction_mode: "alerts" | "all" | "off" — automatic reactions (default: "alerts")
     """
     
@@ -184,6 +187,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
         self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "open")).strip().lower()
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
+        self._response_mode_by_chat = self._coerce_response_modes(
+            config.extra.get("response_mode_by_chat") or config.extra.get("responseModeByChat")
+        )
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
@@ -206,6 +212,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             reactions=reactions_enabled,
             reaction_mode=reaction_mode,
         )
+        self._context_digest_path = get_hermes_home() / "whatsapp" / "context_digests.json"
 
     def _whatsapp_require_mention(self) -> bool:
         configured = self.config.extra.get("require_mention")
@@ -222,6 +229,139 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    @staticmethod
+    def _coerce_response_modes(raw) -> dict[str, str]:
+        """Parse per-chat response modes and keep only supported values."""
+        if not isinstance(raw, dict):
+            return {}
+        modes: dict[str, str] = {}
+        for chat_id, mode in raw.items():
+            key = str(chat_id or "").strip()
+            value = str(mode or "").strip().lower().replace("-", "_")
+            if key and value in {"mention_only", "persona_free", "silent"}:
+                modes[key] = value
+        return modes
+
+    def _response_mode_for_chat(self, chat_id: str) -> str:
+        """Resolve how this group should respond."""
+        if chat_id in self._response_mode_by_chat:
+            return self._response_mode_by_chat[chat_id]
+        if chat_id in self._whatsapp_free_response_chats():
+            return "persona_free"
+        if self._whatsapp_require_mention():
+            return "mention_only"
+        return "persona_free"
+
+    def _context_digest_config(self) -> dict[str, Any]:
+        raw = self.config.extra.get("context_digest") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        enabled_raw = raw.get("enabled", True)
+        if isinstance(enabled_raw, str):
+            enabled = enabled_raw.strip().lower() not in {"false", "0", "no", "off"}
+        else:
+            enabled = bool(enabled_raw)
+        try:
+            max_messages = int(raw.get("max_messages", 20))
+        except (TypeError, ValueError):
+            max_messages = 20
+        try:
+            summary_chars = int(raw.get("summary_chars", 1200))
+        except (TypeError, ValueError):
+            summary_chars = 1200
+        return {
+            "enabled": enabled,
+            "max_messages": max(3, min(max_messages, 50)),
+            "summary_chars": max(240, min(summary_chars, 2400)),
+        }
+
+    def _load_context_digests(self) -> dict[str, Any]:
+        try:
+            if not self._context_digest_path.exists():
+                return {}
+            data = json.loads(self._context_digest_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.debug("Could not load WhatsApp context digests: %s", exc)
+            return {}
+
+    def _save_context_digests(self, data: dict[str, Any]) -> None:
+        try:
+            self._context_digest_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._context_digest_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._context_digest_path)
+        except Exception as exc:
+            logger.debug("Could not save WhatsApp context digests: %s", exc)
+
+    @staticmethod
+    def _sanitize_digest_text(value: object, *, limit: int = 220) -> str:
+        text = " ".join(str(value or "").split())
+        if not text:
+            return ""
+        text = re.sub(r"https?://\S+", "[link]", text)
+        if re.search(r"(?i)(token|secret|password|passwd|api[_-]?key|authorization|bearer|cookie|credential|private)", text):
+            return ""
+        text = re.sub(r"\b\d{8,}@[a-z.]+\b", "participante", text, flags=re.I)
+        text = re.sub(r"\+?\d[\d\s().-]{9,}\d", "[telefone]", text)
+        text = re.sub(r"[A-Za-z0-9_-]{32,}", "[id]", text)
+        if len(text) > limit:
+            text = text[: limit - 3].rstrip() + "..."
+        return text
+
+    def _render_context_digest_prompt(self, chat_id: str) -> str:
+        cfg = self._context_digest_config()
+        if not cfg["enabled"] or not chat_id:
+            return ""
+        record = self._load_context_digests().get(chat_id)
+        if not isinstance(record, dict):
+            return ""
+        digest = str(record.get("digest") or "").strip()
+        if not digest:
+            return ""
+        digest = digest[: cfg["summary_chars"]]
+        return (
+            "Persistent same-chat WhatsApp digest only. "
+            "Use it only for this chatId; never mix chats:\n"
+            f"{digest}"
+        )
+
+    async def _update_context_digest(self, chat_id: str, chat_type: str | None = None) -> None:
+        cfg = self._context_digest_config()
+        if not cfg["enabled"] or not chat_id:
+            return
+        if self._human_policy.chat_kind(chat_type, chat_id).value == "channel":
+            return
+        try:
+            path = f"/history?chatId={quote(chat_id, safe='@._-')}&limit={int(cfg['max_messages'])}"
+            data = await self._bridge_request("GET", path, timeout_seconds=10)
+            messages = data.get("messages") if isinstance(data, dict) else None
+            if not isinstance(messages, list):
+                return
+            lines = []
+            for item in messages[-int(cfg["max_messages"]):]:
+                if not isinstance(item, dict) or item.get("chatId") != chat_id:
+                    continue
+                body = self._sanitize_digest_text(item.get("body"))
+                if not body:
+                    continue
+                sender = self._sanitize_digest_text(item.get("senderName") or item.get("senderId") or "participante", limit=40)
+                sender = sender or "participante"
+                prefix = "EMPRESA.IA" if item.get("fromMe") else sender
+                lines.append(f"- {prefix}: {body}")
+            if not lines:
+                return
+            digest = "\n".join(lines)[-int(cfg["summary_chars"]):]
+            all_digests = self._load_context_digests()
+            all_digests[chat_id] = {
+                "chat_id": chat_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "digest": digest,
+            }
+            self._save_context_digests(all_digests)
+        except Exception as exc:
+            logger.debug("Could not update WhatsApp context digest for %s: %s", chat_id, exc)
 
     def _group_privacy_prompt(self, chat_id: str, chat_name: str | None = None) -> str:
         label = chat_name or chat_id or "this WhatsApp group"
@@ -373,11 +513,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return True
         # Group messages: check mention / free-response settings
         chat_id = str(data.get("chatId") or "")
-        if chat_id in self._whatsapp_free_response_chats():
-            return True
-        if not self._whatsapp_require_mention():
+        response_mode = self._response_mode_for_chat(chat_id)
+        if response_mode == "silent":
+            return False
+        if response_mode == "persona_free":
             return True
         body = str(data.get("body") or "").strip()
+        if body.startswith("/"):
+            return True
         if self._message_is_reply_to_bot(data):
             return True
         if self._message_mentions_bot(data):
@@ -1009,6 +1152,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         """Swap in a terminal reaction when WhatsApp processing completes."""
         if not event or not event.source or not event.message_id:
             return
+        if outcome == ProcessingOutcome.SUCCESS:
+            await self._update_context_digest(event.source.chat_id, event.source.chat_type)
         emoji = self._human_policy.completion_reaction(
             success=outcome == ProcessingOutcome.SUCCESS,
             cancelled=outcome == ProcessingOutcome.CANCELLED,
@@ -1045,6 +1190,19 @@ class WhatsAppAdapter(BasePlatformAdapter):
             logger.debug("Could not get WhatsApp chat info for %s: %s", chat_id, e)
         
         return {"name": chat_id, "type": "dm"}
+
+    async def get_bridge_health(self) -> Dict[str, Any]:
+        """Return WhatsApp bridge health and policy details for /status."""
+        try:
+            data = await self._bridge_request("GET", "/health", timeout_seconds=5)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception as exc:
+            data = {"error": str(exc)}
+        data["reactionMode"] = self._human_policy.reaction_mode
+        data["freeResponseChats"] = sorted(self._whatsapp_free_response_chats())
+        data["responseModeByChat"] = dict(self._response_mode_by_chat)
+        return data
 
     async def _bridge_request(
         self,
@@ -1218,13 +1376,11 @@ class WhatsAppAdapter(BasePlatformAdapter):
             for item in reversed(messages[-limit:]):
                 if not isinstance(item, dict) or item.get("chatId") != chat_id:
                     continue
-                body = " ".join(str(item.get("body") or "").split())
+                body = self._sanitize_digest_text(item.get("body"))
                 if not body:
                     continue
-                sender = str(item.get("senderName") or item.get("senderId") or "alguem")
-                sender = re.sub(r"\d{8,}@[a-z.]+", "participante", sender, flags=re.I)
-                sender = sender[:40]
-                body = body[:240]
+                sender = self._sanitize_digest_text(item.get("senderName") or item.get("senderId") or "alguem", limit=40)
+                sender = sender or "participante"
                 lines.append(f"- {sender}: {body}")
             if not lines:
                 return ""
@@ -1364,6 +1520,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     chat_id,
                     data.get("chatName"),
                 )
+                context_digest = self._render_context_digest_prompt(chat_id)
                 recent_context = ""
                 if self._human_policy.should_inject_context(
                     chat_type=chat_type,
@@ -1375,7 +1532,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         self._human_policy.context_limit(chat_type=chat_type, chat_id=chat_id),
                     )
                 channel_prompt = "\n\n".join(
-                    part for part in (channel_prompt, configured_prompt, group_guard, recent_context) if part
+                    part for part in (channel_prompt, configured_prompt, group_guard, context_digest, recent_context) if part
                 )
 
             return MessageEvent(

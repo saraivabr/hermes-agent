@@ -5,6 +5,7 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
+                  response_mode_by_chat=None,
                   dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
     from gateway.platforms.whatsapp import WhatsAppAdapter
 
@@ -15,6 +16,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["mention_patterns"] = mention_patterns
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if response_mode_by_chat is not None:
+        extra["response_mode_by_chat"] = response_mode_by_chat
     if dm_policy is not None:
         extra["dm_policy"] = dm_policy
     if allow_from is not None:
@@ -32,6 +35,7 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
     adapter._allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("allow_from"))
     adapter._group_policy = str(extra.get("group_policy", "open")).strip().lower()
     adapter._group_allow_from = WhatsAppAdapter._coerce_allow_list(extra.get("group_allow_from"))
+    adapter._response_mode_by_chat = WhatsAppAdapter._coerce_response_modes(extra.get("response_mode_by_chat"))
     adapter._mention_patterns = adapter._compile_mention_patterns()
     adapter._free_response_chats = adapter._whatsapp_free_response_chats()
     return adapter
@@ -129,6 +133,29 @@ def test_config_bridges_whatsapp_group_settings(monkeypatch, tmp_path):
     assert json.loads(__import__("os").environ["WHATSAPP_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
 
 
+def test_config_bridges_whatsapp_response_modes_and_context_digest(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "whatsapp:\n"
+        "  response_mode_by_chat:\n"
+        "    120363001234567890@g.us: persona_free\n"
+        "  context_digest:\n"
+        "    enabled: true\n"
+        "    max_messages: 12\n"
+        "    summary_chars: 900\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    config = load_gateway_config()
+    extra = config.platforms[Platform.WHATSAPP].extra
+
+    assert extra["response_mode_by_chat"] == {"120363001234567890@g.us": "persona_free"}
+    assert extra["context_digest"]["max_messages"] == 12
+
+
 def test_free_response_chats_bypass_mention_gating():
     adapter = _make_adapter(
         require_mention=True,
@@ -145,6 +172,36 @@ def test_free_response_chats_does_not_bypass_other_groups():
     )
 
     assert adapter._should_process_message(_group_message("hello everyone")) is False
+
+
+def test_response_mode_persona_free_bypasses_mention_gating():
+    adapter = _make_adapter(
+        require_mention=True,
+        response_mode_by_chat={"120363001234567890@g.us": "persona_free"},
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone")) is True
+
+
+def test_response_mode_mention_only_overrides_legacy_free_response():
+    adapter = _make_adapter(
+        require_mention=True,
+        mention_patterns=[r"\bempresa\.ia\b"],
+        free_response_chats=["120363001234567890@g.us"],
+        response_mode_by_chat={"120363001234567890@g.us": "mention_only"},
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone")) is False
+    assert adapter._should_process_message(_group_message("empresa.ia ajuda")) is True
+
+
+def test_response_mode_silent_blocks_group_even_when_mentioned():
+    adapter = _make_adapter(
+        require_mention=True,
+        response_mode_by_chat={"120363001234567890@g.us": "silent"},
+    )
+
+    assert adapter._should_process_message(_group_message("empresa.ia ajuda")) is False
 
 
 def test_dm_passes_with_default_open_policy():

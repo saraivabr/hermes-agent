@@ -2368,7 +2368,13 @@ class BasePlatformAdapter(ABC):
         callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else {}
+        if isinstance(getattr(event, "raw_message", None), dict):
+            sender_id = event.raw_message.get("senderId")
+            if sender_id:
+                _thread_metadata["reply_to_participant"] = sender_id
+        if not _thread_metadata:
+            _thread_metadata = None
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)

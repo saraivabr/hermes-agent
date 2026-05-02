@@ -62,6 +62,7 @@ const HISTORY_DIR = getArg('history', process.env.WHATSAPP_HISTORY_DIR || path.j
 const HISTORY_FILE = path.join(HISTORY_DIR, 'messages.jsonl');
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
+const READ_ONLY = ['1', 'true', 'yes', 'on'].includes(String(process.env.WHATSAPP_READ_ONLY || '').toLowerCase());
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *EMPRESA.IA*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
@@ -133,6 +134,14 @@ function requireConnected(res) {
 function requireGroupChatId(chatId, res) {
   if (!chatId || !String(chatId).endsWith('@g.us')) {
     res.status(400).json({ error: 'Valid WhatsApp group chatId ending in @g.us is required' });
+    return false;
+  }
+  return true;
+}
+
+function requireWritable(res) {
+  if (READ_ONLY) {
+    res.status(403).json({ error: 'Bridge is read-only' });
     return false;
   }
   return true;
@@ -288,7 +297,27 @@ function buildLidMap() {
 }
 let lidToPhone = buildLidMap();
 
-const logger = pino({ level: 'warn' });
+const logger = pino({
+  level: process.env.WHATSAPP_BAILEYS_LOG_LEVEL || (WHATSAPP_DEBUG ? 'debug' : 'error'),
+  redact: {
+    paths: [
+      '*.auth',
+      '*.creds',
+      '*.state',
+      '*.currentRatchet',
+      '*.ephemeralKeyPair',
+      '*.pendingPreKey',
+      '*.indexInfo',
+      '*.rootKey',
+      '*.privKey',
+      '*.baseKey',
+      '*.remoteIdentityKey',
+      'fullErrorNode',
+      '*.fullErrorNode',
+    ],
+    censor: '[REDACTED]',
+  },
+});
 
 // Message queue for polling
 const messageQueue = [];
@@ -300,6 +329,8 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+const reconnectCounts = {};
+let lastDisconnectReason = null;
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -338,6 +369,8 @@ async function startSocket() {
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
+      lastDisconnectReason = reason || 'unknown';
+      reconnectCounts[lastDisconnectReason] = (reconnectCounts[lastDisconnectReason] || 0) + 1;
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
@@ -631,6 +664,7 @@ app.get('/search', (req, res) => {
 
 // Send a message
 app.post('/send', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -649,6 +683,22 @@ app.post('/send', async (req, res) => {
     // Track sent message ID to prevent echo-back loops
     if (sent?.key?.id) {
       recentlySentIds.add(sent.key.id);
+      storeHistoryEvent({
+        messageId: sent.key.id,
+        chatId,
+        senderId: normalizeWhatsAppId(sock.user?.id) || 'EMPRESA.IA',
+        senderName: 'EMPRESA.IA',
+        chatName: chatId,
+        isGroup: String(chatId).endsWith('@g.us'),
+        fromMe: true,
+        body: message,
+        hasMedia: false,
+        mediaType: '',
+        mediaUrls: [],
+        mentionedIds: [],
+        quotedParticipant: replyToParticipant || '',
+        timestamp: Math.floor(Date.now() / 1000),
+      });
       if (recentlySentIds.size > MAX_RECENT_IDS) {
         recentlySentIds.delete(recentlySentIds.values().next().value);
       }
@@ -662,6 +712,7 @@ app.post('/send', async (req, res) => {
 
 // Edit a previously sent message
 app.post('/edit', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -701,6 +752,7 @@ function inferMediaType(ext) {
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -751,6 +803,22 @@ app.post('/send-media', async (req, res) => {
     // Track sent message ID to prevent echo-back loops
     if (sent?.key?.id) {
       recentlySentIds.add(sent.key.id);
+      storeHistoryEvent({
+        messageId: sent.key.id,
+        chatId,
+        senderId: normalizeWhatsAppId(sock.user?.id) || 'EMPRESA.IA',
+        senderName: 'EMPRESA.IA',
+        chatName: chatId,
+        isGroup: String(chatId).endsWith('@g.us'),
+        fromMe: true,
+        body: caption || `[${type} sent]`,
+        hasMedia: true,
+        mediaType: type,
+        mediaUrls: [],
+        mentionedIds: [],
+        quotedParticipant: replyToParticipant || '',
+        timestamp: Math.floor(Date.now() / 1000),
+      });
       if (recentlySentIds.size > MAX_RECENT_IDS) {
         recentlySentIds.delete(recentlySentIds.values().next().value);
       }
@@ -764,6 +832,7 @@ app.post('/send-media', async (req, res) => {
 
 // Typing indicator
 app.post('/typing', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected' });
   }
@@ -780,6 +849,7 @@ app.post('/typing', async (req, res) => {
 });
 
 app.post('/presence', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, presence } = req.body || {};
@@ -799,6 +869,7 @@ app.post('/presence', async (req, res) => {
 });
 
 app.post('/read', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, messageId, participant } = req.body || {};
@@ -818,6 +889,7 @@ app.post('/read', async (req, res) => {
 });
 
 app.post('/react', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, messageId, participant, emoji } = req.body || {};
@@ -835,6 +907,7 @@ app.post('/react', async (req, res) => {
 });
 
 app.post('/chat/modify', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, action, durationSeconds, messageId, participant } = req.body || {};
@@ -934,6 +1007,7 @@ app.get('/groups/metadata/:id', async (req, res) => {
 });
 
 app.post('/groups/join-approval', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
   const { chatId, participants, action } = req.body || {};
   if (!requireGroupChatId(chatId, res)) return;
@@ -958,6 +1032,7 @@ app.post('/groups/join-approval', async (req, res) => {
 });
 
 app.post('/groups/create', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { subject, participants } = req.body || {};
@@ -975,6 +1050,7 @@ app.post('/groups/create', async (req, res) => {
 });
 
 app.post('/groups/subject', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, subject } = req.body || {};
@@ -990,6 +1066,7 @@ app.post('/groups/subject', async (req, res) => {
 });
 
 app.post('/groups/description', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, description } = req.body || {};
@@ -1004,6 +1081,7 @@ app.post('/groups/description', async (req, res) => {
 });
 
 app.post('/groups/photo', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, filePath } = req.body || {};
@@ -1023,6 +1101,7 @@ app.post('/groups/photo', async (req, res) => {
 });
 
 app.post('/groups/participants', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, participants, action } = req.body || {};
@@ -1046,6 +1125,7 @@ app.post('/groups/participants', async (req, res) => {
 });
 
 app.post('/groups/settings', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, setting } = req.body || {};
@@ -1065,6 +1145,7 @@ app.post('/groups/settings', async (req, res) => {
 });
 
 app.post('/groups/invite', async (req, res) => {
+  if (!requireWritable(res)) return;
   if (!requireConnected(res)) return;
 
   const { chatId, revoke } = req.body || {};
@@ -1084,6 +1165,9 @@ app.get('/health', (req, res) => {
     status: connectionState,
     queueLength: messageQueue.length,
     uptime: process.uptime(),
+    readOnly: READ_ONLY,
+    reconnects: reconnectCounts,
+    lastDisconnectReason,
   });
 });
 
